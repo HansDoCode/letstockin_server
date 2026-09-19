@@ -1,0 +1,2 @@
+CREATE TABLE IF NOT EXISTS sale_returns (id BIGSERIAL PRIMARY KEY, sale_id BIGINT NOT NULL REFERENCES sales(id), sale_item_id BIGINT NOT NULL REFERENCES sale_items(id), quantity INTEGER NOT NULL CHECK (quantity > 0), refund_cents INTEGER NOT NULL CHECK (refund_cents >= 0), reason TEXT NOT NULL, created_by BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE INDEX IF NOT EXISTS sale_returns_item_idx ON sale_returns(sale_item_id);
