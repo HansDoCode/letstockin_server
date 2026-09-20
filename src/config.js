@@ -4,12 +4,15 @@ import { fileURLToPath } from 'node:url';
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 
-// The documented .env lives at the workspace root. Keep a server-local fallback
-// for deployments that place configuration beside the server package.
-dotenv.config({ path: resolve(sourceDirectory, '../../.env') });
-dotenv.config({ path: resolve(sourceDirectory, '../.env') });
+// Local npm commands use .env.local; production start commands and explicitly
+// production-configured processes use .env. Load only the selected file so a
+// missing local value can never silently fall back to production configuration.
+const productionEnvironment = process.env.NODE_ENV === 'production' || process.env.npm_lifecycle_event === 'start';
+export const environmentFileName = productionEnvironment ? '.env' : '.env.local';
+dotenv.config({ path: resolve(sourceDirectory, '../../', environmentFileName) });
+dotenv.config({ path: resolve(sourceDirectory, '../', environmentFileName) });
 
-const production = process.env.NODE_ENV === 'production';
+const production = productionEnvironment;
 const configuredOrigin = String(process.env.CLIENT_ORIGIN || '').trim();
 const fallbackOrigin = production ? '' : 'http://localhost:5173';
 const configuredDeliveryUrl = String(process.env.PASSWORD_RESET_DELIVERY_URL || '').trim();

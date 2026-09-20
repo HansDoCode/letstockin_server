@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hashPassword, verifyPassword, requireRole } from './auth.js';
+import { hashPassword, verifyPassword, requireRole, sessionCookieOptions } from './auth.js';
 
 test('passwords use salted hashes and reject wrong credentials', async () => {
   const first = await hashPassword('correct horse battery');
@@ -16,4 +16,20 @@ test('role gate uses authenticated user, not request headers', () => {
   let status;
   gate({ user: { role: 'staff' }, headers: { 'x-user-role': 'admin' } }, { status(code) { status = code; return this; }, json() {} }, () => assert.fail('Should deny staff'));
   assert.equal(status, 403);
+});
+
+test('production session cookies support secure partitioned deployments', () => {
+  assert.deepEqual(sessionCookieOptions(true), {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    partitioned: true,
+    path: '/'
+  });
+  assert.deepEqual(sessionCookieOptions(false), {
+    httpOnly: true,
+    secure: false,
+    sameSite: 'lax',
+    path: '/'
+  });
 });

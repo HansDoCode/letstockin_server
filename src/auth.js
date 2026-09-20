@@ -1,5 +1,6 @@
 import { randomBytes, scrypt as scryptCallback, timingSafeEqual, createHash } from 'node:crypto';
 import { promisify } from 'node:util';
+import { isProduction } from './config.js';
 import { pool } from './db.js';
 
 const scrypt = promisify(scryptCallback);
@@ -23,7 +24,20 @@ export async function createSession(userId) {
   return token;
 }
 export const cookieName = 'letstockin_session';
-const cookieOptions = { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' };
+// Production normally reaches Render through the Vercel /api rewrite, making
+// the cookie first-party. Partitioned is also enabled as a safe fallback for
+// browsers that call the Render origin directly while blocking third-party
+// cookies. Exact Origin validation still protects mutating API requests.
+export function sessionCookieOptions(production = isProduction) {
+  return {
+    httpOnly: true,
+    secure: production,
+    sameSite: production ? 'none' : 'lax',
+    ...(production ? { partitioned: true } : {}),
+    path: '/'
+  };
+}
+const cookieOptions = sessionCookieOptions();
 export function setSessionCookie(res, token) { res.cookie(cookieName, token, { ...cookieOptions, maxAge: 7 * 86400000 }); }
 export function clearSessionCookie(res) { res.clearCookie(cookieName, cookieOptions); }
 export async function authenticate(req, res, next) {
