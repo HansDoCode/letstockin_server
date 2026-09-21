@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import './config.js';
-import { clientOrigin, configurationError, isProduction, trustProxy } from './config.js';
+import { clientOrigin, configurationError, isProduction, passwordResetConfigurationError, reportTimeZone, trustProxy } from './config.js';
 import { pool, inTransaction, databaseConfigError } from './db.js';
 import { authenticate, requireRole, verifyPassword, hashPassword, createSession, setSessionCookie, clearSessionCookie } from './auth.js';
 import { loginAttemptKey, isLoginBlocked, recordLoginFailure, clearLoginFailures } from './login-rate-limit.js';
@@ -10,6 +10,7 @@ import { requestPasswordReset, completePasswordReset } from './password-reset.js
 import { validateSale, priceLine } from './sale-validation.js';
 import { returnAmount } from './return-validation.js';
 import { InputError, normalizeProductPayload, parseVariantId, wildcardSearchTerm, POSTGRES_INT_MAX } from './input-validation.js';
+import { normalizeReportQuery, ReportInputError } from './report-validation.js';
 
 const app = express();
 app.set('trust proxy', trustProxy);
@@ -75,6 +76,7 @@ app.post('/api/auth/login', limitLogin, async (req, res, next) => {
 app.post('/api/auth/password-reset/request', limitPasswordReset, async (req, res, next) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   if (!/^\S+@\S+\.\S+$/.test(email) || email.length > 320) return res.status(400).json({ error: 'A valid email address is required.' });
+  if (passwordResetConfigurationError) return res.status(503).json({ error: 'Password reset is temporarily unavailable. Contact an administrator.' });
   try {
     const result = await requestPasswordReset(email);
     if (result.deliveryFailed) console.error('Password reset delivery failed.');
@@ -113,16 +115,18 @@ app.get('/api/products', requireRole('staff', 'admin'), async (req, res, next) =
     const { rows } = await pool.query(`
       SELECT p.id, p.name, p.status, p.created_at,
         COALESCE(SUM(i.quantity), 0)::int AS stock,
-        json_agg(json_build_object('id', v.id, 'size', v.size, 'sku', v.sku,
-          'barcode', v.barcode, 'qrCode', v.qr_code, 'priceCents', v.price_cents,
+        json_agg(json_build_object('id', v.id, 'size', v.size, 'color', v.color, 'sku', v.sku,
+          'barcode', (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='barcode'),
+          'qrCode', (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='qr'), 'priceCents', v.price_cents,
           'stock', COALESCE(i.quantity, 0), 'reorderPoint', i.reorder_point)
-          ORDER BY v.size) FILTER (WHERE v.id IS NOT NULL) AS variants
+          ORDER BY v.color, v.size) FILTER (WHERE v.id IS NOT NULL) AS variants
       FROM products p
       LEFT JOIN product_variants v ON v.product_id = p.id
       LEFT JOIN inventory_levels i ON i.variant_id = v.id
       WHERE ${statusClause ? `${statusClause} AND ` : ''}(p.name ILIKE $1 ESCAPE '\\' OR p.created_at::date::text ILIKE $1 ESCAPE '\\' OR EXISTS (
         SELECT 1 FROM product_variants matched WHERE matched.product_id=p.id
-          AND (matched.barcode ILIKE $1 ESCAPE '\\' OR matched.qr_code ILIKE $1 ESCAPE '\\' OR matched.size ILIKE $1 ESCAPE '\\' OR matched.sku ILIKE $1 ESCAPE '\\')))
+          AND (matched.size ILIKE $1 ESCAPE '\\' OR matched.color ILIKE $1 ESCAPE '\\' OR matched.sku ILIKE $1 ESCAPE '\\'
+            OR EXISTS (SELECT 1 FROM product_identifiers identifier WHERE identifier.variant_id=matched.id AND identifier.code ILIKE $1 ESCAPE '\\'))))
       GROUP BY p.id
       ORDER BY (COALESCE(SUM(i.quantity), 0) > 0) DESC, p.name ASC`, params);
     res.json(rows);
@@ -133,11 +137,17 @@ app.get('/api/products/lookup/:code', requireRole('staff', 'admin'), async (req,
   const code = typeof req.params.code === 'string' ? req.params.code.trim() : '';
   if (!code || code.length > 200) return res.status(400).json({ error: 'A barcode or QR code is required.' });
   try {
-    const { rows } = await pool.query(`SELECT p.id AS product_id, p.name, v.id AS variant_id, v.size, v.price_cents,
-      i.quantity FROM product_variants v JOIN products p ON p.id=v.product_id
-      JOIN inventory_levels i ON i.variant_id=v.id WHERE p.status='active' AND (v.barcode=$1 OR v.qr_code=$1)`, [code]);
-    if (!rows[0]) return res.status(404).json({ error: 'No product matches this barcode or QR code.' });
-    res.json(rows[0]);
+    const { rows: matches } = await pool.query(`SELECT p.id AS "productId", p.name, p.status, v.id AS "matchedVariantId", pi.identifier_type AS "identifierType"
+      FROM product_identifiers pi JOIN product_variants v ON v.id=pi.variant_id JOIN products p ON p.id=v.product_id
+      WHERE p.status='active' AND pi.code=$1`, [code]);
+    const match = matches[0];
+    if (!match) return res.status(404).json({ error: 'No active product matches this barcode or QR code.' });
+    const { rows: variants } = await pool.query(`SELECT v.id, v.size, v.color, v.sku, v.price_cents AS "priceCents", i.quantity,
+      i.reorder_point AS "reorderPoint",
+      (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='barcode') AS barcode,
+      (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='qr') AS "qrCode"
+      FROM product_variants v JOIN inventory_levels i ON i.variant_id=v.id WHERE v.product_id=$1 ORDER BY v.color, v.size`, [match.productId]);
+    res.json({ ...match, variants });
   } catch (error) { next(error); }
 });
 
@@ -152,11 +162,11 @@ app.patch('/api/products/:id/status', requireRole('admin'), async (req, res, nex
   } catch (error) { next(error); }
 });
 
-app.get('/api/alerts/low-stock', requireRole('admin'), async (_req, res, next) => {
+app.get('/api/alerts/low-stock', requireRole('staff', 'admin'), async (_req, res, next) => {
   try {
-    const { rows } = await pool.query(`SELECT v.id AS "variantId", p.name, v.size, i.quantity, i.reorder_point FROM inventory_levels i
+    const { rows } = await pool.query(`SELECT v.id AS "variantId", p.name, v.size, v.color, i.quantity, i.reorder_point AS "reorderPoint" FROM inventory_levels i
       JOIN product_variants v ON v.id=i.variant_id JOIN products p ON p.id=v.product_id
-      WHERE p.status='active' AND i.quantity <= i.reorder_point ORDER BY i.quantity ASC, p.name`);
+      WHERE p.status='active' AND i.quantity <= i.reorder_point ORDER BY (i.quantity=0) DESC, i.quantity ASC, p.name, v.color, v.size`);
     res.json(rows);
   } catch (error) { next(error); }
 });
@@ -165,13 +175,16 @@ app.get('/api/inventory', requireRole('staff', 'admin'), async (req, res, next) 
   let term;
   try { term = wildcardSearchTerm(req.query.q); } catch (error) { return res.status(400).json({ error: error.message }); }
   try {
-    const { rows } = await pool.query(`SELECT p.id AS product_id, p.name, v.id AS variant_id, v.size, v.sku,
-      v.barcode, v.qr_code AS "qrCode", v.price_cents AS "priceCents", i.quantity, i.reorder_point AS "reorderPoint",
+    const { rows } = await pool.query(`SELECT p.id AS product_id, p.name, v.id AS variant_id, v.size, v.color, v.sku,
+      (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='barcode') AS barcode,
+      (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='qr') AS "qrCode",
+      v.price_cents AS "priceCents", i.quantity, i.reorder_point AS "reorderPoint",
       i.updated_at AS "updatedAt" FROM products p JOIN product_variants v ON v.product_id=p.id
       JOIN inventory_levels i ON i.variant_id=v.id
       WHERE p.id IN (SELECT match_product.id FROM products match_product JOIN product_variants match_variant ON match_variant.product_id=match_product.id
-        WHERE match_product.name ILIKE $1 ESCAPE '\\' OR match_variant.size ILIKE $1 ESCAPE '\\' OR match_variant.barcode ILIKE $1 ESCAPE '\\' OR match_variant.qr_code ILIKE $1 ESCAPE '\\')
-      ORDER BY p.name, v.size`, [term]);
+        WHERE match_product.name ILIKE $1 ESCAPE '\\' OR match_variant.size ILIKE $1 ESCAPE '\\' OR match_variant.color ILIKE $1 ESCAPE '\\'
+          OR EXISTS (SELECT 1 FROM product_identifiers identifier WHERE identifier.variant_id=match_variant.id AND identifier.code ILIKE $1 ESCAPE '\\'))
+      ORDER BY p.name, v.color, v.size`, [term]);
     res.json(rows);
   } catch (error) { next(error); }
 });
@@ -224,6 +237,71 @@ app.get('/api/reports/overview', requireRole('admin'), async (_req, res, next) =
   } catch (error) { next(error); }
 });
 
+app.get('/api/reports/sales', requireRole('admin'), async (req, res, next) => {
+  let options;
+  try { options = normalizeReportQuery(req.query); }
+  catch (error) {
+    if (error instanceof ReportInputError) return res.status(400).json({ error: error.message });
+    return next(error);
+  }
+  try {
+    const { rows: rangeRows } = await pool.query(`SELECT
+      CASE $1 WHEN 'custom' THEN $2::date WHEN 'daily' THEN (NOW() AT TIME ZONE $4)::date
+        WHEN 'weekly' THEN date_trunc('week', NOW() AT TIME ZONE $4)::date
+        ELSE date_trunc('month', NOW() AT TIME ZONE $4)::date END AS "from",
+      CASE $1 WHEN 'custom' THEN $3::date WHEN 'daily' THEN (NOW() AT TIME ZONE $4)::date
+        WHEN 'weekly' THEN (date_trunc('week', NOW() AT TIME ZONE $4) + INTERVAL '6 days')::date
+        ELSE (date_trunc('month', NOW() AT TIME ZONE $4) + INTERVAL '1 month - 1 day')::date END AS "to"`,
+    [options.period, options.from, options.to, reportTimeZone]);
+    const range = rangeRows[0];
+    const bounds = [range.from, range.to, reportTimeZone];
+    const [{ rows: summaryRows }, { rows: seriesRows }, { rows: activityRows }] = await Promise.all([
+      pool.query(`WITH bounds AS (
+          SELECT ($1::date::timestamp AT TIME ZONE $3) AS start_at, (($2::date + 1)::timestamp AT TIME ZONE $3) AS end_at
+        ), sale_totals AS (
+          SELECT COALESCE(SUM(s.subtotal_cents),0)::bigint AS gross, COALESCE(SUM(s.discount_cents),0)::bigint AS discounts,
+            COUNT(*)::int AS orders, COALESCE(SUM(items.units),0)::bigint AS units
+          FROM sales s CROSS JOIN bounds b LEFT JOIN LATERAL (SELECT SUM(quantity)::bigint AS units FROM sale_items WHERE sale_id=s.id) items ON true
+          WHERE s.created_at >= b.start_at AND s.created_at < b.end_at
+        ), return_totals AS (
+          SELECT COALESCE(SUM(r.refund_cents),0)::bigint AS refunds, COALESCE(SUM(r.quantity),0)::bigint AS units
+          FROM sale_returns r CROSS JOIN bounds b WHERE r.created_at >= b.start_at AND r.created_at < b.end_at
+        ) SELECT sale_totals.gross AS "grossSalesCents", sale_totals.discounts AS "discountCents",
+          return_totals.refunds AS "refundCents", (sale_totals.gross-sale_totals.discounts-return_totals.refunds)::bigint AS "netSalesCents",
+          sale_totals.orders AS "orderCount", sale_totals.units AS "unitsSold", return_totals.units AS "unitsReturned"
+        FROM sale_totals CROSS JOIN return_totals`, bounds),
+      pool.query(`WITH days AS (SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS day),
+        sale_days AS (SELECT (created_at AT TIME ZONE $3)::date AS day, SUM(total_cents)::bigint AS total, COUNT(*)::int AS orders
+          FROM sales WHERE created_at >= ($1::date::timestamp AT TIME ZONE $3) AND created_at < (($2::date + 1)::timestamp AT TIME ZONE $3) GROUP BY 1),
+        return_days AS (SELECT (created_at AT TIME ZONE $3)::date AS day, SUM(refund_cents)::bigint AS refunds
+          FROM sale_returns WHERE created_at >= ($1::date::timestamp AT TIME ZONE $3) AND created_at < (($2::date + 1)::timestamp AT TIME ZONE $3) GROUP BY 1)
+        SELECT days.day::text AS date, (COALESCE(sale_days.total,0)-COALESCE(return_days.refunds,0))::bigint AS "netSalesCents",
+          COALESCE(sale_days.orders,0)::int AS "orderCount" FROM days LEFT JOIN sale_days USING (day) LEFT JOIN return_days USING (day) ORDER BY days.day`, bounds),
+      pool.query(`WITH activity AS (
+          SELECT 'sale'::text AS type, s.id, s.created_at AS "occurredAt", s.id AS "saleId", u.name AS "staffName",
+            COALESCE(SUM(si.quantity),0)::int AS units, s.subtotal_cents AS "grossCents", s.discount_cents AS "discountCents",
+            0::int AS "refundCents", s.total_cents AS "totalCents"
+          FROM sales s LEFT JOIN users u ON u.id=s.staff_id LEFT JOIN sale_items si ON si.sale_id=s.id
+          WHERE s.created_at >= ($1::date::timestamp AT TIME ZONE $3) AND s.created_at < (($2::date + 1)::timestamp AT TIME ZONE $3)
+          GROUP BY s.id, u.name
+          UNION ALL
+          SELECT 'refund'::text, r.id, r.created_at, r.sale_id, u.name, r.quantity, 0, 0, r.refund_cents, -r.refund_cents
+          FROM sale_returns r LEFT JOIN users u ON u.id=r.created_by
+          WHERE r.created_at >= ($1::date::timestamp AT TIME ZONE $3) AND r.created_at < (($2::date + 1)::timestamp AT TIME ZONE $3)
+        ) SELECT *, COUNT(*) OVER()::int AS "totalCount" FROM activity ORDER BY "occurredAt" DESC, type, id DESC LIMIT $4 OFFSET $5`,
+      [...bounds, options.pageSize, (options.page - 1) * options.pageSize])
+    ]);
+    const numericKeys = ['grossSalesCents', 'discountCents', 'refundCents', 'netSalesCents', 'orderCount', 'unitsSold', 'unitsReturned'];
+    const summary = summaryRows[0];
+    for (const key of numericKeys) summary[key] = Number(summary[key]);
+    const series = seriesRows.map(row => ({ ...row, netSalesCents: Number(row.netSalesCents), orderCount: Number(row.orderCount) }));
+    const activities = activityRows.map(({ totalCount, ...row }) => ({ ...row, units: Number(row.units), grossCents: Number(row.grossCents), discountCents: Number(row.discountCents), refundCents: Number(row.refundCents), totalCents: Number(row.totalCents) }));
+    const totalItems = activityRows.length ? activityRows[0].totalCount : 0;
+    res.json({ range: { period: options.period, from: range.from, to: range.to, timeZone: reportTimeZone }, summary, series, activities,
+      pagination: { page: options.page, pageSize: options.pageSize, totalItems, totalPages: Math.ceil(totalItems / options.pageSize) } });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/users', requireRole('admin'), async (_req, res, next) => {
   try {
     const { rows } = await pool.query(`SELECT id, name, email, role, created_at AS "createdAt" FROM users ORDER BY name`);
@@ -260,9 +338,11 @@ app.post('/api/products', requireRole('admin'), async (req, res, next) => {
       const { rows: products } = await db.query('INSERT INTO products (name) VALUES ($1) RETURNING id, name, status', [payload.name]);
       const product = products[0];
       for (const entry of payload.variants) {
-        const { size, sku, barcode, qrCode, priceCents, quantity, reorderPoint } = entry;
-        const { rows: saved } = await db.query(`INSERT INTO product_variants (product_id, size, sku, barcode, qr_code, price_cents)
-          VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`, [product.id, size, sku, barcode, qrCode, priceCents]);
+        const { size, color, sku, barcode, qrCode, priceCents, quantity, reorderPoint } = entry;
+        const { rows: saved } = await db.query(`INSERT INTO product_variants (product_id, size, color, sku, price_cents)
+          VALUES ($1,$2,$3,$4,$5) RETURNING id`, [product.id, size, color, sku, priceCents]);
+        if (barcode) await db.query("INSERT INTO product_identifiers (variant_id, identifier_type, code) VALUES ($1,'barcode',$2)", [saved[0].id, barcode]);
+        if (qrCode) await db.query("INSERT INTO product_identifiers (variant_id, identifier_type, code) VALUES ($1,'qr',$2)", [saved[0].id, qrCode]);
         await db.query('INSERT INTO inventory_levels (variant_id, quantity, reorder_point) VALUES ($1,$2,$3)', [saved[0].id, quantity, reorderPoint]);
         if (quantity) await db.query(`INSERT INTO inventory_movements (variant_id, quantity_delta, reason, reference_type, created_by)
           VALUES ($1,$2,'opening_stock','product',$3)`, [saved[0].id, quantity, req.user.id]);
@@ -320,7 +400,7 @@ app.get('/api/sales/:id/receipt', requireRole('staff', 'admin'), async (req, res
     const { rows: sales } = await pool.query(`SELECT s.id, s.created_at AS "createdAt", s.staff_id AS "staffId", u.name AS "staffName", s.subtotal_cents AS "subtotalCents", s.discount_cents AS "discountCents", s.total_cents AS "totalCents", p.method AS "paymentMethod", p.status AS "paymentStatus" FROM sales s JOIN users u ON u.id=s.staff_id JOIN payments p ON p.sale_id=s.id WHERE s.id=$1`, [req.params.id]);
     const sale = sales[0];
     if (!sale || (req.user.role !== 'admin' && String(sale.staffId) !== String(req.user.id))) return res.status(404).json({ error: 'Sale not found.' });
-    const { rows: items } = await pool.query(`SELECT si.id, pr.name, v.size, si.quantity, si.unit_price_cents AS "unitPriceCents", si.discount_cents AS "discountCents", si.total_cents AS "totalCents", si.discount_reason AS "discountReason", COALESCE(r.returned_quantity,0)::int AS "returnedQuantity", COALESCE(r.refunded_cents,0)::int AS "refundedCents" FROM sale_items si JOIN product_variants v ON v.id=si.variant_id JOIN products pr ON pr.id=v.product_id LEFT JOIN (SELECT sale_item_id, SUM(quantity) returned_quantity, SUM(refund_cents) refunded_cents FROM sale_returns GROUP BY sale_item_id) r ON r.sale_item_id=si.id WHERE si.sale_id=$1 ORDER BY si.id`, [req.params.id]);
+    const { rows: items } = await pool.query(`SELECT si.id, pr.name, v.size, v.color, si.quantity, si.unit_price_cents AS "unitPriceCents", si.discount_cents AS "discountCents", si.total_cents AS "totalCents", si.discount_reason AS "discountReason", COALESCE(r.returned_quantity,0)::int AS "returnedQuantity", COALESCE(r.refunded_cents,0)::int AS "refundedCents" FROM sale_items si JOIN product_variants v ON v.id=si.variant_id JOIN products pr ON pr.id=v.product_id LEFT JOIN (SELECT sale_item_id, SUM(quantity) returned_quantity, SUM(refund_cents) refunded_cents FROM sale_returns GROUP BY sale_item_id) r ON r.sale_item_id=si.id WHERE si.sale_id=$1 ORDER BY si.id`, [req.params.id]);
     res.json({ ...sale, items });
   } catch (error) { next(error); }
 });

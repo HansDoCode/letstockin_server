@@ -2,13 +2,41 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import pg from 'pg';
-import './config.js';
+
+process.env.NODE_ENV = 'test';
+await import('./config.js');
 
 const testUrl = process.env.TEST_DATABASE_URL;
 let databaseName = '';
 try { databaseName = testUrl ? new URL(testUrl).pathname.slice(1) : ''; } catch { /* The test is skipped below when the URL is not usable. */ }
 const schemaIsolation = process.env.TEST_DATABASE_SCHEMA_ISOLATION === 'true';
 const safeDatabase = /test/i.test(databaseName) || schemaIsolation;
+
+test('variant color, typed identifier, and minimum threshold migration preserves legacy inventory', { skip: !testUrl || !safeDatabase ? 'A safe test database is required.' : false }, async () => {
+  const schema = `letstockin_migration_${process.pid}_${Date.now()}`;
+  const owner = new pg.Client({ connectionString: testUrl, connectionTimeoutMillis: 5000 });
+  await owner.connect();
+  try {
+    await owner.query(`CREATE SCHEMA "${schema}"`);
+    await owner.query(`SET search_path TO "${schema}"`);
+    await owner.query(`CREATE TABLE product_variants (id BIGSERIAL PRIMARY KEY, barcode TEXT UNIQUE, qr_code TEXT UNIQUE);
+      CREATE TABLE inventory_levels (variant_id BIGINT PRIMARY KEY REFERENCES product_variants(id), quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0), reorder_point INTEGER NOT NULL DEFAULT 3 CHECK (reorder_point >= 0));
+      INSERT INTO product_variants (id, barcode, qr_code) VALUES (1, 'LEGACY-BAR', 'LEGACY-QR');
+      INSERT INTO inventory_levels (variant_id, quantity, reorder_point) VALUES (1, 2, 3);`);
+    await owner.query(await readFile(new URL('../db/migrations/007_variant_colors_identifiers_low_stock.sql', import.meta.url), 'utf8'));
+    const migrated = await owner.query(`SELECT v.color, i.reorder_point AS "reorderPoint",
+      (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='barcode') AS barcode,
+      (SELECT code FROM product_identifiers WHERE variant_id=v.id AND identifier_type='qr') AS "qrCode"
+      FROM product_variants v JOIN inventory_levels i ON i.variant_id=v.id WHERE v.id=1`);
+    assert.deepEqual(migrated.rows[0], { color: 'Unspecified', reorderPoint: 5, barcode: 'LEGACY-BAR', qrCode: 'LEGACY-QR' });
+    const columns = await owner.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='product_variants'", [schema]);
+    assert.equal(columns.rows.some(row => row.column_name === 'barcode' || row.column_name === 'qr_code'), false);
+  } finally {
+    await owner.query('SET search_path TO public');
+    await owner.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await owner.end();
+  }
+});
 
 test('API/database sales, adjustments, returns, permissions, and lookup', { skip: !testUrl || !safeDatabase ? 'Set TEST_DATABASE_URL to a dedicated test database, or explicitly enable TEST_DATABASE_SCHEMA_ISOLATION=true for an isolated test database/project.' : false }, async () => {
   const schema = `letstockin_test_${process.pid}_${Date.now()}`;
@@ -23,7 +51,6 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql']) {
       await owner.query(await readFile(new URL(`../db/migrations/${migration}`, import.meta.url), 'utf8'));
     }
-    process.env.NODE_ENV = 'test';
     process.env.DATABASE_URL = testUrl;
     process.env.DATABASE_SCHEMA = schema;
     const [{ default: app }, { pool: appPool }, { hashPassword }, { getTestPasswordResetDelivery }] = await Promise.all([
@@ -58,22 +85,35 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.equal((await call('/inventory/1/adjustments', 'POST', { quantityDelta: 1, reason: 'count' }, staffCookie)).status, 403);
     assert.equal((await call('/sales/1/returns', 'POST', { saleItemId: 1, quantity: 1, reason: 'return' }, staffCookie)).status, 403);
     assert.equal((await call('/reports/overview', 'GET', undefined, staffCookie)).status, 403);
+    assert.equal((await call('/reports/sales', 'GET', undefined, staffCookie)).status, 403);
+    assert.equal((await call('/alerts/low-stock', 'GET', undefined, staffCookie)).status, 200);
     assert.equal((await call('/products', 'POST', { name: 'Broken product', variants: [{ size: 'M', sku: 'BAD', priceCents: -1 }] }, adminCookie)).status, 400);
     assert.equal((await call('/users', 'POST', { name: 'No role', email: 'norole@integration.test', password }, adminCookie)).status, 400);
 
     const created = await call('/products', 'POST', { name: 'Integration Shirt', variants: [
-      { size: 'S', sku: `S-${schema}`, barcode: `BAR-${schema}`, qrCode: `QR-${schema}`, priceCents: 1001, quantity: 3, reorderPoint: 1 },
-      { size: 'M', sku: `M-${schema}`, barcode: `BAR-M-${schema}`, qrCode: `QR-M-${schema}`, priceCents: 1200, quantity: 2, reorderPoint: 1 }
+      { size: 'S', color: 'Navy', sku: `S-${schema}`, barcode: `BAR-${schema}`, qrCode: `QR-${schema}`, priceCents: 1001, quantity: 3, reorderPoint: 5 },
+      { size: 'M', color: 'Ivory', sku: `M-${schema}`, barcode: `BAR-M-${schema}`, qrCode: `QR-M-${schema}`, priceCents: 1200, quantity: 8, reorderPoint: 5 },
+      { size: 'L', color: 'Red', sku: `L-${schema}`, barcode: `BAR-L-${schema}`, qrCode: `QR-L-${schema}`, priceCents: 1300, quantity: 6, reorderPoint: 7 }
     ] }, adminCookie);
     assert.equal(created.status, 201);
     const inventory = await call(`/inventory?q=${encodeURIComponent(`QR-${schema}`)}`, 'GET', undefined, staffCookie);
     assert.equal(inventory.status, 200);
-    assert.equal(inventory.body.length, 2);
+    assert.equal(inventory.body.length, 3);
     const productSearch = await call(`/products?q=${encodeURIComponent(`BAR-${schema}`)}`, 'GET', undefined, staffCookie);
-    assert.equal(productSearch.body[0].variants.length, 2);
+    assert.equal(productSearch.body[0].variants.length, 3);
     const small = inventory.body.find(row => row.size === 'S');
+    assert.equal(small.color, 'Navy');
     const lookup = await call(`/products/lookup/${encodeURIComponent(`BAR-${schema}`)}`, 'GET', undefined, staffCookie);
-    assert.equal(lookup.body.variant_id, small.variant_id);
+    assert.equal(lookup.body.identifierType, 'barcode');
+    assert.equal(String(lookup.body.matchedVariantId), String(small.variant_id));
+    assert.equal(lookup.body.variants.length, 3);
+    const qrLookup = await call(`/products/lookup/${encodeURIComponent(`QR-${schema}`)}`, 'GET', undefined, staffCookie);
+    assert.equal(qrLookup.body.identifierType, 'qr');
+    const lowStock = await call('/alerts/low-stock', 'GET', undefined, staffCookie);
+    assert.equal(lowStock.body.some(row => row.size === 'S' && row.reorderPoint === 5), true);
+    assert.equal(lowStock.body.some(row => row.size === 'L' && row.reorderPoint === 7), true);
+    assert.equal(lowStock.body.some(row => row.size === 'M'), false);
+    assert.equal((await call('/products', 'POST', { name: 'Collision', variants: [{ size: 'S', color: 'Red', sku: `COL-${schema}`, barcode: `QR-${schema}`, priceCents: 1, quantity: 0, reorderPoint: 5 }] }, adminCookie)).status, 409);
     assert.equal((await call('/products/lookup/absent', 'GET', undefined, staffCookie)).status, 404);
 
     const sale = await call('/sales', 'POST', { items: [{ variantId: small.variant_id, quantity: 3, discountCents: 2, discountReason: 'promotion' }], paymentMethod: 'cash' }, staffCookie);
@@ -83,6 +123,7 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.equal((await call('/inventory/1/adjustments', 'POST', { quantityDelta: -1, reason: 'count' }, staffCookie, { 'x-user-role': 'admin' })).status, 403);
     const receipt = await call(`/sales/${sale.body.id}/receipt`, 'GET', undefined, staffCookie);
     assert.equal(receipt.body.items[0].totalCents, 3001);
+    assert.equal(receipt.body.items[0].color, 'Navy');
     const itemId = receipt.body.items[0].id;
     const firstReturn = await call(`/sales/${sale.body.id}/returns`, 'POST', { saleItemId: Number(itemId), quantity: 1, reason: 'size issue' }, adminCookie);
     assert.equal(firstReturn.status, 201);
@@ -112,6 +153,14 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.deepEqual(payments.rows[0], { amount_cents: 3001, method: 'cash' });
     const overview = await call('/reports/overview', 'GET', undefined, adminCookie);
     assert.equal(overview.body.todaySalesCents, 0);
+    const report = await call('/reports/sales?period=daily&page=1&pageSize=10', 'GET', undefined, adminCookie);
+    assert.equal(report.status, 200);
+    assert.equal(report.body.summary.grossSalesCents, 3003);
+    assert.equal(report.body.summary.discountCents, 2);
+    assert.equal(report.body.summary.refundCents, 3001);
+    assert.equal(report.body.summary.netSalesCents, 0);
+    assert.equal(report.body.activities.length, 3);
+    assert.equal((await call('/reports/sales?period=custom&from=2024-02-30&to=2024-03-01', 'GET', undefined, adminCookie)).status, 400);
     assert.equal((await pool.query('SELECT quantity FROM inventory_levels WHERE variant_id=$1', [small.variant_id])).rows[0].quantity, 1);
     assert.equal((await pool.query('SELECT id FROM users WHERE id=$1', [admin.id])).rowCount, 1);
 

@@ -47,22 +47,30 @@ export function normalizeProductPayload(body) {
   if (!Array.isArray(body.variants) || body.variants.length < 1 || body.variants.length > 100) {
     throw new InputError('A product must contain 1–100 size variants.');
   }
-  const sizes = new Set();
+  const variantKeys = new Set();
+  const identifiers = new Set();
   const variants = body.variants.map((entry, index) => {
     if (!isObject(entry)) throw new InputError(`Variant ${index + 1} is invalid.`);
     const size = requiredText(entry.size, `Variant ${index + 1} size`, 50);
-    const sizeKey = size.toLocaleLowerCase('en-US');
-    if (sizes.has(sizeKey)) throw new InputError(`Variant sizes must be unique (${size}).`);
-    sizes.add(sizeKey);
-    return {
+    const color = requiredText(entry.color, `Variant ${index + 1} color`, 50);
+    const variantKey = `${size.toLocaleLowerCase('en-US')}\u0000${color.toLocaleLowerCase('en-US')}`;
+    if (variantKeys.has(variantKey)) throw new InputError(`Variant size and color combinations must be unique (${size}, ${color}).`);
+    variantKeys.add(variantKey);
+    const variant = {
       size,
+      color,
       sku: requiredText(entry.sku, `Variant ${index + 1} SKU`, 100),
       barcode: optionalText(entry.barcode, `Variant ${index + 1} barcode`, 200),
       qrCode: optionalText(entry.qrCode, `Variant ${index + 1} QR code`, 200),
       priceCents: integer(entry.priceCents, `Variant ${index + 1} price`, { min: 0 }),
       quantity: integer(entry.quantity, `Variant ${index + 1} quantity`, { defaultValue: 0 }),
-      reorderPoint: integer(entry.reorderPoint, `Variant ${index + 1} reorder point`, { defaultValue: 0 })
+      reorderPoint: integer(entry.reorderPoint, `Variant ${index + 1} reorder point`, { defaultValue: 5, min: 5 })
     };
+    for (const code of [variant.barcode, variant.qrCode].filter(Boolean)) {
+      if (identifiers.has(code)) throw new InputError(`Barcode and QR codes must be unique (${code}).`);
+      identifiers.add(code);
+    }
+    return variant;
   });
   return { name, variants };
 }

@@ -20,6 +20,7 @@ const configuredDeliveryToken = String(process.env.PASSWORD_RESET_DELIVERY_TOKEN
 const configuredDeliveryProvider = String(process.env.PASSWORD_RESET_DELIVERY_PROVIDER || '').trim().toLowerCase();
 const configuredResendApiKey = String(process.env.RESEND_API_KEY || '').trim();
 const configuredPasswordResetFromEmail = String(process.env.PASSWORD_RESET_FROM_EMAIL || '').trim();
+const configuredReportTimeZone = String(process.env.REPORT_TIME_ZONE || '').trim() || 'America/Los_Angeles';
 
 export function parseClientOrigin(value) {
   if (!value) return '';
@@ -56,11 +57,17 @@ function validFromEmail(value) {
   return /^\S+@\S+\.\S+$/.test(address);
 }
 
+function validTimeZone(value) {
+  try { new Intl.DateTimeFormat('en-US', { timeZone: value }).format(); return true; }
+  catch { return false; }
+}
+
 export const isProduction = production;
 export const clientOrigin = parseClientOrigin(configuredOrigin || fallbackOrigin);
 export const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
 export const passwordResetDeliveryProvider = configuredDeliveryProvider || (configuredDeliveryUrl || configuredDeliveryToken ? 'webhook' : 'resend');
 export const passwordResetFromEmail = configuredPasswordResetFromEmail;
+export const reportTimeZone = configuredReportTimeZone;
 const originConfigurationError = configuredOrigin && !clientOrigin
   ? 'CLIENT_ORIGIN must be an absolute HTTP(S) origin without credentials, query parameters, or fragments.'
   : production && (!clientOrigin || !clientOrigin.startsWith('https:'))
@@ -82,4 +89,14 @@ const resendConfigurationError = passwordResetDeliveryProvider === 'resend' && c
 const providerConfigurationError = configuredDeliveryProvider && !['resend', 'webhook'].includes(configuredDeliveryProvider)
   ? 'PASSWORD_RESET_DELIVERY_PROVIDER must be resend or webhook.'
   : '';
-export const configurationError = originConfigurationError || providerConfigurationError || webhookConfigurationError || resendConfigurationError;
+const reportTimeZoneConfigurationError = !validTimeZone(configuredReportTimeZone)
+  ? 'REPORT_TIME_ZONE must be a valid IANA timezone.'
+  : '';
+export const passwordResetConfigurationError = process.env.NODE_ENV === 'test'
+  ? ''
+  : passwordResetDeliveryProvider === 'resend' && (!configuredResendApiKey || !validFromEmail(configuredPasswordResetFromEmail))
+    ? 'Resend password reset delivery requires an API key and verified sender email.'
+    : passwordResetDeliveryProvider === 'webhook' && !deliveryUrl
+      ? 'Password reset webhook delivery requires a valid URL.'
+      : providerConfigurationError || webhookConfigurationError || resendConfigurationError;
+export const configurationError = originConfigurationError || providerConfigurationError || webhookConfigurationError || resendConfigurationError || reportTimeZoneConfigurationError || passwordResetConfigurationError;
