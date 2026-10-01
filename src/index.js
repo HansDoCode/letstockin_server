@@ -9,7 +9,7 @@ import { passwordResetAttemptKey, isPasswordResetBlocked, recordPasswordResetReq
 import { requestPasswordReset, completePasswordReset } from './password-reset.js';
 import { validateSale, priceLine } from './sale-validation.js';
 import { returnAmount } from './return-validation.js';
-import { InputError, normalizeProductPayload, parseVariantId, wildcardSearchTerm, POSTGRES_INT_MAX } from './input-validation.js';
+import { InputError, normalizeProductPayload, normalizeProductVariantUpdatePayload, parseVariantId, wildcardSearchTerm, POSTGRES_INT_MAX } from './input-validation.js';
 import { normalizeReportQuery, ReportInputError } from './report-validation.js';
 
 const app = express();
@@ -162,6 +162,80 @@ app.patch('/api/products/:id/status', requireRole('admin'), async (req, res, nex
   } catch (error) { next(error); }
 });
 
+app.patch('/api/products/:id/variants', requireRole('admin'), async (req, res, next) => {
+  if (!/^\d+$/.test(req.params.id) || !Number.isSafeInteger(Number(req.params.id)) || Number(req.params.id) < 1) return res.status(400).json({ error: 'Invalid product ID.' });
+  let payload;
+  try { payload = normalizeProductVariantUpdatePayload(req.body); }
+  catch (error) {
+    if (error instanceof InputError) return res.status(400).json({ error: error.message });
+    return next(error);
+  }
+  try {
+    const updated = await inTransaction(async (db) => {
+      const { rows: products } = await db.query('SELECT id, name FROM products WHERE id=$1 FOR UPDATE', [req.params.id]);
+      const product = products[0];
+      if (!product) return null;
+      const { rows: currentVariants } = await db.query(`SELECT v.id, v.size, v.color, v.price_cents AS "priceCents", i.quantity
+        FROM product_variants v JOIN inventory_levels i ON i.variant_id=v.id
+        WHERE v.product_id=$1 ORDER BY v.id FOR UPDATE OF v, i`, [req.params.id]);
+      if (currentVariants.length !== payload.variants.length) throw new Error('Product variants changed. Reload the product and try again.');
+      const currentById = new Map(currentVariants.map(variant => [String(variant.id), variant]));
+      const variantKeys = new Set();
+      for (const entry of payload.variants) {
+        const current = currentById.get(entry.id);
+        if (!current) throw new Error('Product variants changed. Reload the product and try again.');
+        if (current.quantity !== entry.expectedQuantity) throw new Error('Stock changed while this form was open. Reload the product and try again.');
+        const key = `${current.size.toLocaleLowerCase('en-US')}\u0000${entry.color.toLocaleLowerCase('en-US')}`;
+        if (variantKeys.has(key)) throw new InputError(`Variant size and color combinations must be unique (${current.size}, ${entry.color}).`);
+        variantKeys.add(key);
+      }
+      for (const entry of payload.variants) {
+        const current = currentById.get(entry.id);
+        const delta = entry.quantity - current.quantity;
+        if (current.color !== entry.color || current.priceCents !== entry.priceCents) {
+          await db.query('UPDATE product_variants SET color=$1, price_cents=$2 WHERE id=$3', [entry.color, entry.priceCents, entry.id]);
+        }
+        if (delta) {
+          await db.query('UPDATE inventory_levels SET quantity=$1, updated_at=NOW() WHERE variant_id=$2', [entry.quantity, entry.id]);
+          await db.query(`INSERT INTO inventory_movements (variant_id, quantity_delta, reason, reference_type, reference_id, created_by)
+            VALUES ($1,$2,$3,'product_update',$4,$5)`, [entry.id, delta, payload.reason, product.id, req.user.id]);
+        }
+      }
+      return { ...product, updatedVariants: payload.variants.length };
+    });
+    if (!updated) return res.status(404).json({ error: 'Product not found.' });
+    res.json(updated);
+  } catch (error) {
+    if (error instanceof InputError) return res.status(400).json({ error: error.message });
+    if (/^(Product variants changed|Stock changed while)/.test(error.message)) return res.status(409).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.delete('/api/products/:id', requireRole('admin'), async (req, res, next) => {
+  if (!/^\d+$/.test(req.params.id) || !Number.isSafeInteger(Number(req.params.id)) || Number(req.params.id) < 1) return res.status(400).json({ error: 'Invalid product ID.' });
+  try {
+    const product = await inTransaction(async (db) => {
+      const { rows: products } = await db.query('SELECT id, name FROM products WHERE id=$1 FOR UPDATE', [req.params.id]);
+      const current = products[0];
+      if (!current) return null;
+      const { rows: sales } = await db.query(`SELECT 1 FROM sale_items si
+        JOIN product_variants v ON v.id=si.variant_id WHERE v.product_id=$1 LIMIT 1`, [req.params.id]);
+      if (sales[0]) throw new Error('Product has sales history and cannot be deleted. Archive it instead.');
+      await db.query('DELETE FROM inventory_movements WHERE variant_id IN (SELECT id FROM product_variants WHERE product_id=$1)', [req.params.id]);
+      await db.query('DELETE FROM inventory_levels WHERE variant_id IN (SELECT id FROM product_variants WHERE product_id=$1)', [req.params.id]);
+      await db.query('DELETE FROM product_variants WHERE product_id=$1', [req.params.id]);
+      await db.query('DELETE FROM products WHERE id=$1', [req.params.id]);
+      return current;
+    });
+    if (!product) return res.status(404).json({ error: 'Product not found.' });
+    res.json({ ok: true, product });
+  } catch (error) {
+    if (error.message === 'Product has sales history and cannot be deleted. Archive it instead.') return res.status(409).json({ error: error.message });
+    next(error);
+  }
+});
+
 app.get('/api/alerts/low-stock', requireRole('staff', 'admin'), async (_req, res, next) => {
   try {
     const { rows } = await pool.query(`SELECT v.id AS "variantId", p.name, v.size, v.color, i.quantity, i.reorder_point AS "reorderPoint" FROM inventory_levels i
@@ -184,7 +258,7 @@ app.get('/api/inventory', requireRole('staff', 'admin'), async (req, res, next) 
       WHERE p.id IN (SELECT match_product.id FROM products match_product JOIN product_variants match_variant ON match_variant.product_id=match_product.id
         WHERE match_product.name ILIKE $1 ESCAPE '\\' OR match_variant.size ILIKE $1 ESCAPE '\\' OR match_variant.color ILIKE $1 ESCAPE '\\'
           OR EXISTS (SELECT 1 FROM product_identifiers identifier WHERE identifier.variant_id=match_variant.id AND identifier.code ILIKE $1 ESCAPE '\\'))
-      ORDER BY p.name, v.color, v.size`, [term]);
+      ORDER BY (i.quantity <= i.reorder_point) ASC, p.name, v.color, v.size`, [term]);
     res.json(rows);
   } catch (error) { next(error); }
 });

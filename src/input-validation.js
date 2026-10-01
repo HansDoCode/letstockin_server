@@ -53,6 +53,7 @@ export function normalizeProductPayload(body) {
     if (!isObject(entry)) throw new InputError(`Variant ${index + 1} is invalid.`);
     const size = requiredText(entry.size, `Variant ${index + 1} size`, 50);
     const color = requiredText(entry.color, `Variant ${index + 1} color`, 50);
+    if (color.toLocaleLowerCase('en-US') === 'unspecified') throw new InputError(`Variant ${index + 1} color must be specified.`);
     const variantKey = `${size.toLocaleLowerCase('en-US')}\u0000${color.toLocaleLowerCase('en-US')}`;
     if (variantKeys.has(variantKey)) throw new InputError(`Variant size and color combinations must be unique (${size}, ${color}).`);
     variantKeys.add(variantKey);
@@ -73,6 +74,30 @@ export function normalizeProductPayload(body) {
     return variant;
   });
   return { name, variants };
+}
+
+export function normalizeProductVariantUpdatePayload(body) {
+  if (!isObject(body) || !Array.isArray(body.variants) || body.variants.length < 1 || body.variants.length > 100) {
+    throw new InputError('A product update must contain 1–100 variants.');
+  }
+  const reason = requiredText(body.reason, 'Stock change reason', 500);
+  const ids = new Set();
+  const variants = body.variants.map((entry, index) => {
+    if (!isObject(entry)) throw new InputError(`Variant ${index + 1} is invalid.`);
+    const id = parseVariantId(String(entry.id));
+    if (ids.has(id)) throw new InputError(`Variant ${index + 1} is duplicated.`);
+    ids.add(id);
+    const color = requiredText(entry.color, `Variant ${index + 1} color`, 50);
+    if (color.toLocaleLowerCase('en-US') === 'unspecified') throw new InputError(`Variant ${index + 1} color must be specified.`);
+    return {
+      id,
+      color,
+      priceCents: integer(entry.priceCents, `Variant ${index + 1} price`, { min: 0 }),
+      quantity: integer(entry.quantity, `Variant ${index + 1} quantity`),
+      expectedQuantity: integer(entry.expectedQuantity, `Variant ${index + 1} expected quantity`)
+    };
+  });
+  return { reason, variants };
 }
 
 export function parseVariantId(value) {
