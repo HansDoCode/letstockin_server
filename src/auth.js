@@ -38,7 +38,7 @@ export function sessionCookieOptions(production = isProduction) {
   };
 }
 const cookieOptions = sessionCookieOptions();
-export function setSessionCookie(res, token) { res.cookie(cookieName, token, { ...cookieOptions, maxAge: 7 * 86400000 }); }
+export function setSessionCookie(res, token, remember = false) { res.cookie(cookieName, token, { ...cookieOptions, ...(remember ? { maxAge: 7 * 86400000 } : {}) }); }
 export function clearSessionCookie(res) { res.clearCookie(cookieName, cookieOptions); }
 export async function authenticate(req, res, next) {
   try {

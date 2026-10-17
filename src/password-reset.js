@@ -1,11 +1,11 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { inTransaction, pool } from './db.js';
 import { clientOrigin, isProduction, passwordResetDeliveryProvider, passwordResetFromEmail } from './config.js';
 import { hashPassword } from './auth.js';
 
 const TOKEN_TTL = '1 hour';
 const TOKEN_TTL_MINUTES = 60;
-const RESEND_ENDPOINT = 'https://api.resend.com/emails';
+const BREVO_ENDPOINT = 'https://api.brevo.com/v3/smtp/email';
 let testDelivery = null;
 
 const tokenDigest = token => createHash('sha256').update(String(token)).digest('hex');
@@ -26,27 +26,34 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
 }
 
+function parseSender(value) {
+  const match = String(value).match(/^(.*?)\s*<([^<>]+)>$/);
+  if (!match) return { email: String(value) };
+  const name = match[1].trim();
+  return { email: match[2], ...(name ? { name } : {}) };
+}
+
 export function createPasswordResetEmail({ email, name, url }) {
-  const recipientName = String(name || '').trim().replace(/\s+/g, ' ') || 'there';
-  const safeName = escapeHtml(recipientName);
+  const recipientName = String(name || '').trim().replace(/\s+/g, ' ');
+  const safeName = escapeHtml(recipientName || 'there');
   const safeUrl = escapeHtml(url);
   return {
-    from: passwordResetFromEmail,
-    to: [email],
+    sender: parseSender(passwordResetFromEmail),
+    to: [{ email, ...(recipientName ? { name: recipientName } : {}) }],
     subject: 'Reset your Letstockin password',
-    html: `<p>Hello ${safeName},</p><p>We received a request to reset your Letstockin password.</p><p><a href="${safeUrl}">Reset your password</a></p><p>This link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.</p>`,
-    text: `Hello ${recipientName},\n\nWe received a request to reset your Letstockin password.\n\nReset your password: ${url}\n\nThis link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.`
+    htmlContent: `<p>Hello ${safeName},</p><p>We received a request to reset your Letstockin password.</p><p><a href="${safeUrl}">Reset your password</a></p><p>This link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.</p>`,
+    textContent: `Hello ${recipientName || 'there'},\n\nWe received a request to reset your Letstockin password.\n\nReset your password: ${url}\n\nThis link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.`
   };
 }
 
-async function deliverWithResend({ email, name, url, idempotencyKey }) {
-  const apiKey = String(process.env.RESEND_API_KEY || '').trim();
+async function deliverWithBrevo({ email, name, url, idempotencyKey }) {
+  const apiKey = String(process.env.BREVO_API_KEY || '').trim();
   if (!apiKey || !passwordResetFromEmail) throw new PasswordResetDeliveryError();
   try {
-    const response = await fetch(RESEND_ENDPOINT, {
+    const response = await fetch(BREVO_ENDPOINT, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}`, ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}) },
-      body: JSON.stringify(createPasswordResetEmail({ email, name, url })),
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'api-key': apiKey },
+      body: JSON.stringify({ ...createPasswordResetEmail({ email, name, url }), ...(idempotencyKey ? { headers: { idempotencyKey } } : {}) }),
       redirect: 'error',
       signal: AbortSignal.timeout(5000)
     });
@@ -82,7 +89,7 @@ export async function deliverPasswordReset({ email, name, url, idempotencyKey })
     testDelivery = { email, name, resetUrl: url, expiresInMinutes: TOKEN_TTL_MINUTES };
     return;
   }
-  if (passwordResetDeliveryProvider === 'resend') return deliverWithResend({ email, name, url, idempotencyKey });
+  if (passwordResetDeliveryProvider === 'brevo') return deliverWithBrevo({ email, name, url, idempotencyKey });
   return deliverWithWebhook({ email, name, url });
 }
 
@@ -103,7 +110,7 @@ export async function requestPasswordReset(email) {
   });
 
   try {
-    await deliverPasswordReset({ email: user.email, name: user.name, url: resetUrl(token), idempotencyKey: tokenHash });
+    await deliverPasswordReset({ email: user.email, name: user.name, url: resetUrl(token), idempotencyKey: randomUUID() });
     await inTransaction(async client => {
       await client.query('UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND token_hash <> $2 AND used_at IS NULL', [user.id, tokenHash]);
     });

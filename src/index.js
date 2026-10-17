@@ -7,6 +7,7 @@ import { authenticate, requireRole, verifyPassword, hashPassword, createSession,
 import { loginAttemptKey, isLoginBlocked, recordLoginFailure, clearLoginFailures } from './login-rate-limit.js';
 import { passwordResetAttemptKey, isPasswordResetBlocked, recordPasswordResetRequest } from './password-reset-rate-limit.js';
 import { requestPasswordReset, completePasswordReset } from './password-reset.js';
+import { beginMfaSetup, confirmMfaSetup, createMfaChallenge, disableMfa, getMfaStatus, MfaAlreadyEnabledError, MfaConfigurationError, rotateRecoveryCodes, verifyMfaChallenge } from './mfa.js';
 import { validateSale, priceLine } from './sale-validation.js';
 import { returnAmount } from './return-validation.js';
 import { InputError, normalizeProductPayload, normalizeProductVariantUpdatePayload, parseVariantId, wildcardSearchTerm, POSTGRES_INT_MAX } from './input-validation.js';
@@ -29,7 +30,7 @@ app.use((_req, res, next) => {
 });
 app.use(express.json({ limit: '100kb' }));
 app.use((req, res, next) => {
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && req.headers.origin && req.headers.origin !== clientOrigin) return res.status(403).json({ error: 'Origin not allowed.' });
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && ((!req.headers.origin && isProduction) || (req.headers.origin && req.headers.origin !== clientOrigin))) return res.status(403).json({ error: 'Origin not allowed.' });
   next();
 });
 async function limitLogin(req, res, next) {
@@ -57,20 +58,101 @@ async function limitPasswordReset(req, res, next) {
   } catch (error) { next(error); }
 }
 
+async function currentPasswordMatches(userId, password) {
+  if (typeof password !== 'string' || password.length < 12 || password.length > 256) return false;
+  const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [userId]);
+  return Boolean(rows[0] && await verifyPassword(password, rows[0].password_hash));
+}
+
+async function revokeOtherSessions(userId, currentSessionHash) {
+  await pool.query('DELETE FROM sessions WHERE user_id=$1 AND token_hash <> $2', [userId, currentSessionHash]);
+}
+
 app.post('/api/auth/login', limitLogin, async (req, res, next) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = req.body?.password;
+  const remember = req.body?.remember === true;
   if (!email || typeof password !== 'string') return res.status(400).json({ error: 'Email and password are required.' });
   try {
-    const { rows } = await pool.query('SELECT id, name, email, role, password_hash FROM users WHERE lower(email)=$1', [email]);
+    const { rows } = await pool.query(`SELECT u.id, u.name, u.email, u.role, u.password_hash,
+      EXISTS(SELECT 1 FROM user_mfa WHERE user_id=u.id) AS "mfaEnabled"
+      FROM users u WHERE lower(u.email)=$1`, [email]);
     const user = rows[0];
     if (!user || !(await verifyPassword(password, user.password_hash))) {
       await recordLoginFailure(req.loginKey);
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
+    if (user.mfaEnabled) return res.json({ mfaRequired: true, challenge: await createMfaChallenge(user.id, req.loginKey) });
     await clearLoginFailures(req.loginKey);
-    setSessionCookie(res, await createSession(user.id));
+    setSessionCookie(res, await createSession(user.id), remember);
     res.json({ id: user.id, name: user.name, email: user.email, role: user.role });
+  } catch (error) { next(error); }
+});
+app.post('/api/auth/mfa/verify', async (req, res, next) => {
+  const challenge = typeof req.body?.challenge === 'string' ? req.body.challenge.trim() : '';
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  const remember = req.body?.remember === true;
+  if (!/^[a-f0-9]{64}$/.test(challenge) || !code || code.length > 64) return res.status(400).json({ error: 'A valid MFA challenge and code are required.' });
+  try {
+    const result = await verifyMfaChallenge(challenge, code);
+    if (result.status !== 'ok') {
+      if (result.loginKey) await recordLoginFailure(result.loginKey);
+      if (result.locked) { res.set('Retry-After', '900'); return res.status(429).json({ error: 'Too many verification attempts. Try again later.' }); }
+      return res.status(401).json({ error: 'Invalid verification code.' });
+    }
+    const { rows } = await pool.query('SELECT id, name, email, role FROM users WHERE id=$1', [result.userId]);
+    if (!rows[0]) return res.status(401).json({ error: 'Invalid verification code.' });
+    await clearLoginFailures(result.loginKey);
+    setSessionCookie(res, await createSession(result.userId), remember);
+    res.json(rows[0]);
+  } catch (error) { next(error); }
+});
+app.get('/api/auth/mfa/status', authenticate, async (req, res, next) => {
+  try { res.json(await getMfaStatus(req.user.id)); } catch (error) { next(error); }
+});
+app.post('/api/auth/mfa/setup', authenticate, async (req, res, next) => {
+  try {
+    if (!await currentPasswordMatches(req.user.id, req.body?.password)) return res.status(401).json({ error: 'Current password is incorrect.' });
+    const { rows } = await pool.query('SELECT email FROM users WHERE id=$1', [req.user.id]);
+    res.json(await beginMfaSetup(req.user.id, rows[0].email));
+  } catch (error) {
+    if (error instanceof MfaAlreadyEnabledError) return res.status(409).json({ error: error.message });
+    if (error instanceof MfaConfigurationError) return res.status(503).json({ error: 'MFA is temporarily unavailable. Contact an administrator.' });
+    next(error);
+  }
+});
+app.post('/api/auth/mfa/setup/confirm', authenticate, async (req, res, next) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  if (!code || code.length > 64) return res.status(400).json({ error: 'A valid authenticator code is required.' });
+  try {
+    const result = await confirmMfaSetup(req.user.id, code);
+    if (result.status === 'expired') return res.status(400).json({ error: 'MFA setup expired. Start again.' });
+    if (result.status === 'locked') return res.status(429).json({ error: 'Too many setup attempts. Start MFA setup again.' });
+    if (result.status === 'already-enabled') return res.status(409).json({ error: 'MFA is already enabled.' });
+    if (result.status !== 'ok') return res.status(400).json({ error: 'Invalid authenticator code.' });
+    await revokeOtherSessions(req.user.id, req.sessionHash);
+    res.json({ recoveryCodes: result.recoveryCodes });
+  } catch (error) {
+    if (error instanceof MfaConfigurationError) return res.status(503).json({ error: 'MFA is temporarily unavailable. Contact an administrator.' });
+    next(error);
+  }
+});
+app.post('/api/auth/mfa/recovery-codes', authenticate, async (req, res, next) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  try {
+    if (!await currentPasswordMatches(req.user.id, req.body?.password)) return res.status(401).json({ error: 'Current password is incorrect.' });
+    const recoveryCodes = await rotateRecoveryCodes(req.user.id, code);
+    if (!recoveryCodes) return res.status(400).json({ error: 'Invalid MFA code.' });
+    res.json({ recoveryCodes });
+  } catch (error) { next(error); }
+});
+app.post('/api/auth/mfa/disable', authenticate, async (req, res, next) => {
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  try {
+    if (!await currentPasswordMatches(req.user.id, req.body?.password)) return res.status(401).json({ error: 'Current password is incorrect.' });
+    if (!await disableMfa(req.user.id, code)) return res.status(400).json({ error: 'Invalid MFA code.' });
+    await revokeOtherSessions(req.user.id, req.sessionHash);
+    res.json({ ok: true });
   } catch (error) { next(error); }
 });
 app.post('/api/auth/password-reset/request', limitPasswordReset, async (req, res, next) => {

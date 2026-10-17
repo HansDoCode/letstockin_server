@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hashPassword, verifyPassword, requireRole, sessionCookieOptions } from './auth.js';
+import { hashPassword, verifyPassword, requireRole, sessionCookieOptions, setSessionCookie } from './auth.js';
 
 test('passwords use salted hashes and reject wrong credentials', async () => {
   const first = await hashPassword('correct horse battery');
@@ -32,4 +32,13 @@ test('production session cookies support secure partitioned deployments', () => 
     sameSite: 'lax',
     path: '/'
   });
+});
+
+test('remember me makes the HTTP-only session cookie persistent', () => {
+  const cookies = [];
+  const response = { cookie: (...args) => cookies.push(args) };
+  setSessionCookie(response, 'a'.repeat(64));
+  setSessionCookie(response, 'b'.repeat(64), true);
+  assert.equal(cookies[0][2].maxAge, undefined);
+  assert.equal(cookies[1][2].maxAge, 7 * 86400000);
 });
