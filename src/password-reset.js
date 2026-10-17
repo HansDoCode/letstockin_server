@@ -11,9 +11,11 @@ let testDelivery = null;
 const tokenDigest = token => createHash('sha256').update(String(token)).digest('hex');
 
 export class PasswordResetDeliveryError extends Error {
-  constructor() {
+  constructor({ status = null, code = null } = {}) {
     super('Password reset delivery is unavailable.');
     this.name = 'PasswordResetDeliveryError';
+    this.status = Number.isInteger(status) ? status : null;
+    this.code = typeof code === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(code) ? code : null;
   }
 }
 
@@ -57,8 +59,16 @@ async function deliverWithBrevo({ email, name, url, idempotencyKey }) {
       redirect: 'error',
       signal: AbortSignal.timeout(5000)
     });
-    if (!response.ok) throw new Error('delivery status');
-  } catch {
+    if (!response.ok) {
+      let code = null;
+      try {
+        const payload = await response.json();
+        if (typeof payload?.code === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(payload.code)) code = payload.code;
+      } catch {}
+      throw new PasswordResetDeliveryError({ status: response.status, code });
+    }
+  } catch (error) {
+    if (error instanceof PasswordResetDeliveryError) throw error;
     throw new PasswordResetDeliveryError();
   }
 }
@@ -115,9 +125,13 @@ export async function requestPasswordReset(email) {
       await client.query('UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=$1 AND token_hash <> $2 AND used_at IS NULL', [user.id, tokenHash]);
     });
     return { deliveryFailed: false };
-  } catch {
+  } catch (error) {
     await pool.query('DELETE FROM password_reset_tokens WHERE token_hash=$1', [tokenHash]).catch(() => {});
-    return { deliveryFailed: true };
+    return {
+      deliveryFailed: true,
+      deliveryStatus: error instanceof PasswordResetDeliveryError ? error.status : null,
+      deliveryCode: error instanceof PasswordResetDeliveryError ? error.code : null
+    };
   }
 }
 

@@ -161,7 +161,7 @@ app.post('/api/auth/password-reset/request', limitPasswordReset, async (req, res
   if (passwordResetConfigurationError) return res.status(503).json({ error: 'Password reset is temporarily unavailable. Contact an administrator.' });
   try {
     const result = await requestPasswordReset(email);
-    if (result.deliveryFailed) console.error('Password reset delivery failed.');
+    if (result.deliveryFailed) console.error('Password reset delivery failed.', { status: result.deliveryStatus, code: result.deliveryCode });
     res.status(202).json({ message: 'If an account matches that email, a reset link will be sent shortly.' });
   } catch (error) { next(error); }
 });

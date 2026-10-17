@@ -48,6 +48,21 @@ test('Brevo delivery exposes only a generic error on provider failure', async ()
 
   await assert.rejects(
     deliverPasswordReset({ email: 'staff@example.test', name: 'Staff', url: 'https://pos.example.test/reset-password#token=unit-value' }),
-    error => error instanceof PasswordResetDeliveryError && error.message === 'Password reset delivery is unavailable.'
+    error => error instanceof PasswordResetDeliveryError
+      && error.message === 'Password reset delivery is unavailable.'
+      && error.status === 500
+      && error.code === null
+  );
+});
+
+test('Brevo delivery keeps only a safe provider error code', async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ code: 'invalid_parameter', message: 'recipient details omitted' }), { status: 400 });
+
+  await assert.rejects(
+    deliverPasswordReset({ email: 'staff@example.test', name: 'Staff', url: 'https://pos.example.test/reset-password#token=unit-value' }),
+    error => error instanceof PasswordResetDeliveryError
+      && error.status === 400
+      && error.code === 'invalid_parameter'
+      && error.message === 'Password reset delivery is unavailable.'
   );
 });
