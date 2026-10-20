@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import pg from 'pg';
 
 process.env.NODE_ENV = 'test';
+process.env.MFA_ENCRYPTION_KEY = 'integration-test-mfa-key-that-is-not-production';
 await import('./config.js');
 
 const testUrl = process.env.TEST_DATABASE_URL;
@@ -65,8 +66,8 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     }
     process.env.DATABASE_URL = testUrl;
     process.env.DATABASE_SCHEMA = schema;
-    const [{ default: app }, { pool: appPool }, { hashPassword }, { getTestPasswordResetDelivery }] = await Promise.all([
-      import('./index.js'), import('./db.js'), import('./auth.js'), import('./password-reset.js')
+    const [{ default: app }, { pool: appPool }, { hashPassword }, { getTestPasswordResetDelivery }, { totpCode }] = await Promise.all([
+      import('./index.js'), import('./db.js'), import('./auth.js'), import('./password-reset.js'), import('./mfa.js')
     ]);
     pool = appPool;
     const password = 'integration-test-password';
@@ -90,8 +91,35 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     const staffLogin = await call('/auth/login', 'POST', { email: 'staff@integration.test', password });
     assert.equal(adminLogin.status, 200);
     assert.equal(staffLogin.status, 200);
-    const adminCookie = adminLogin.cookie;
+    let adminCookie = adminLogin.cookie;
     const staffCookie = staffLogin.cookie;
+    const mfaStatus = await call('/auth/mfa/status', 'GET', undefined, adminCookie);
+    assert.deepEqual(mfaStatus.body, { enabled: false, recoveryCodesRemaining: 0 });
+    const mfaSetup = await call('/auth/mfa/setup', 'POST', { password }, adminCookie);
+    assert.equal(mfaSetup.status, 200);
+    const mfaSecret = mfaSetup.body.secret;
+    assert.match(mfaSecret, /^[A-Z2-7]+$/);
+    const mfaConfirmed = await call('/auth/mfa/setup/confirm', 'POST', { code: totpCode(mfaSecret) }, adminCookie);
+    assert.equal(mfaConfirmed.status, 200);
+    assert.equal(mfaConfirmed.body.recoveryCodes.length, 10);
+    const mfaLogin = await call('/auth/login', 'POST', { email: 'admin@integration.test', password });
+    assert.equal(mfaLogin.status, 200);
+    assert.equal(mfaLogin.body.mfaRequired, true);
+    const mfaVerified = await call('/auth/mfa/verify', 'POST', { challenge: mfaLogin.body.challenge, code: totpCode(mfaSecret) });
+    assert.equal(mfaVerified.status, 200);
+    adminCookie = mfaVerified.cookie;
+    const recoveryLogin = await call('/auth/login', 'POST', { email: 'admin@integration.test', password });
+    const recoveryVerified = await call('/auth/mfa/verify', 'POST', { challenge: recoveryLogin.body.challenge, code: mfaConfirmed.body.recoveryCodes[0] });
+    assert.equal(recoveryVerified.status, 200);
+    const reusedRecoveryLogin = await call('/auth/login', 'POST', { email: 'admin@integration.test', password });
+    const reusedRecovery = await call('/auth/mfa/verify', 'POST', { challenge: reusedRecoveryLogin.body.challenge, code: mfaConfirmed.body.recoveryCodes[0] });
+    assert.equal(reusedRecovery.status, 401);
+    const rotatedCodes = await call('/auth/mfa/recovery-codes', 'POST', { password, code: totpCode(mfaSecret) }, mfaVerified.cookie);
+    assert.equal(rotatedCodes.status, 200);
+    assert.equal(rotatedCodes.body.recoveryCodes.length, 10);
+    const disabledMfa = await call('/auth/mfa/disable', 'POST', { password, code: totpCode(mfaSecret) }, mfaVerified.cookie);
+    assert.deepEqual(disabledMfa.body, { ok: true });
+    assert.deepEqual((await call('/auth/mfa/status', 'GET', undefined, mfaVerified.cookie)).body, { enabled: false, recoveryCodesRemaining: 0 });
     assert.equal((await call('/api-does-not-exist')).status, 404);
     assert.equal((await call('/inventory')).status, 401);
     assert.equal((await call('/inventory/1/adjustments', 'POST', { quantityDelta: 1, reason: 'count' }, staffCookie)).status, 403);
@@ -114,6 +142,17 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.deepEqual(inventory.body.map(row => row.size), ['M', 'S', 'L']);
     const productSearch = await call(`/products?q=${encodeURIComponent(`BAR-${schema}`)}`, 'GET', undefined, staffCookie);
     assert.equal(productSearch.body[0].variants.length, 3);
+    const noBarcode = await call('/products', 'POST', { name: 'Barcode Shirt', variants: [{ size: 'M', color: 'Black', sku: `BARCODE-${schema}`, barcode: '', qrCode: `BARCODE-QR-${schema}`, priceCents: 900, quantity: 10, reorderPoint: 5 }] }, adminCookie);
+    assert.equal(noBarcode.status, 201);
+    const noBarcodeInventory = await call(`/inventory?q=${encodeURIComponent(`BARCODE-QR-${schema}`)}`, 'GET', undefined, staffCookie);
+    const noBarcodeVariant = noBarcodeInventory.body[0];
+    assert.equal(noBarcodeVariant.barcode, null);
+    assert.equal((await call(`/inventory/${noBarcodeVariant.variant_id}/barcode`, 'POST', undefined, staffCookie)).status, 403);
+    const generatedBarcode = await call(`/inventory/${noBarcodeVariant.variant_id}/barcode`, 'POST', undefined, adminCookie);
+    assert.equal(generatedBarcode.status, 200);
+    assert.match(generatedBarcode.body.barcode, /^LS-BAR-[A-Z0-9]{12}$/);
+    const generatedAgain = await call(`/inventory/${noBarcodeVariant.variant_id}/barcode`, 'POST', undefined, adminCookie);
+    assert.equal(generatedAgain.body.barcode, generatedBarcode.body.barcode);
     const deletable = await call('/products', 'POST', { name: 'Temporary Product', variants: [{ size: 'One', color: 'Black', sku: `TMP-${schema}`, priceCents: 500, quantity: 1, reorderPoint: 5 }] }, adminCookie);
     assert.equal(deletable.status, 201);
     assert.equal((await call(`/products/${deletable.body.id}`, 'DELETE', undefined, staffCookie)).status, 403);

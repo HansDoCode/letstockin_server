@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { randomUUID } from 'node:crypto';
 import './config.js';
 import { clientOrigin, configurationError, isProduction, passwordResetConfigurationError, reportTimeZone, trustProxy } from './config.js';
 import { pool, inTransaction, databaseConfigError } from './db.js';
@@ -345,6 +346,30 @@ app.get('/api/inventory', requireRole('staff', 'admin'), async (req, res, next) 
   } catch (error) { next(error); }
 });
 
+app.post('/api/inventory/:variantId/barcode', requireRole('admin'), async (req, res, next) => {
+  let variantId;
+  try { variantId = parseVariantId(req.params.variantId); } catch (error) { return res.status(400).json({ error: error.message }); }
+  try {
+    const result = await inTransaction(async (db) => {
+      const { rows } = await db.query(`SELECT v.id AS "variantId", p.name, v.size, v.color, pi.code AS barcode
+        FROM product_variants v JOIN products p ON p.id=v.product_id
+        LEFT JOIN product_identifiers pi ON pi.variant_id=v.id AND pi.identifier_type='barcode'
+        WHERE v.id=$1 FOR UPDATE OF v`, [variantId]);
+      const variant = rows[0];
+      if (!variant) return null;
+      if (variant.barcode) return variant;
+      const barcode = `LS-BAR-${randomUUID().replace(/-/g, '').slice(-12).toUpperCase()}`;
+      await db.query("INSERT INTO product_identifiers (variant_id, identifier_type, code) VALUES ($1,'barcode',$2)", [variantId, barcode]);
+      return { ...variant, barcode };
+    });
+    if (!result) return res.status(404).json({ error: 'Inventory item not found.' });
+    res.json(result);
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'A barcode already exists for this item.' });
+    next(error);
+  }
+});
+
 app.post('/api/inventory/:variantId/adjustments', requireRole('admin'), async (req, res, next) => {
   let variantId;
   try { variantId = parseVariantId(req.params.variantId); } catch (error) { return res.status(400).json({ error: error.message }); }
@@ -590,6 +615,7 @@ app.post('/api/sales/:id/returns', requireRole('admin'), async (req, res, next) 
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'Endpoint not found.' }));
 app.use((error, _req, res, _next) => {
+  if (error instanceof MfaConfigurationError) return res.status(503).json({ error: 'MFA is temporarily unavailable. Contact an administrator.' });
   if (error instanceof SyntaxError && error.status === 400 && 'body' in error) return res.status(400).json({ error: 'Request body must be valid JSON.' });
   console.error(error);
   res.status(500).json({ error: 'Request could not be completed.' });

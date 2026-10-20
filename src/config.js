@@ -20,6 +20,7 @@ const configuredDeliveryToken = String(process.env.PASSWORD_RESET_DELIVERY_TOKEN
 const configuredDeliveryProvider = String(process.env.PASSWORD_RESET_DELIVERY_PROVIDER || '').trim().toLowerCase();
 const configuredBrevoApiKey = String(process.env.BREVO_API_KEY || '').trim();
 const configuredPasswordResetFromEmail = String(process.env.PASSWORD_RESET_FROM_EMAIL || '').trim();
+const configuredMfaEncryptionKey = String(process.env.MFA_ENCRYPTION_KEY || '').trim();
 const configuredReportTimeZone = String(process.env.REPORT_TIME_ZONE || '').trim() || 'America/Los_Angeles';
 
 export function parseClientOrigin(value) {
@@ -86,6 +87,9 @@ const brevoConfigurationError = passwordResetDeliveryProvider === 'brevo' && con
     : passwordResetDeliveryProvider === 'brevo' && production && (!configuredBrevoApiKey || !validFromEmail(configuredPasswordResetFromEmail))
       ? 'Brevo password reset delivery requires an API key and verified sender email in production.'
       : '';
+export const mfaConfigurationError = production && configuredMfaEncryptionKey.length < 32
+  ? 'MFA_ENCRYPTION_KEY must be at least 32 characters in production.'
+  : '';
 const providerConfigurationError = configuredDeliveryProvider && !['brevo', 'webhook'].includes(configuredDeliveryProvider)
   ? 'PASSWORD_RESET_DELIVERY_PROVIDER must be brevo or webhook.'
   : '';
@@ -99,4 +103,4 @@ export const passwordResetConfigurationError = process.env.NODE_ENV === 'test'
     : passwordResetDeliveryProvider === 'webhook' && !deliveryUrl
       ? 'Password reset webhook delivery requires a valid URL.'
       : providerConfigurationError || webhookConfigurationError || brevoConfigurationError;
-export const configurationError = originConfigurationError || providerConfigurationError || webhookConfigurationError || brevoConfigurationError || reportTimeZoneConfigurationError || passwordResetConfigurationError;
+export const configurationError = originConfigurationError || providerConfigurationError || webhookConfigurationError || brevoConfigurationError || mfaConfigurationError || reportTimeZoneConfigurationError || passwordResetConfigurationError;
