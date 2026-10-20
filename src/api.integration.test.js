@@ -61,7 +61,7 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     await owner.query(`CREATE SCHEMA "${schema}"`);
     await owner.query(`SET search_path TO "${schema}"`);
     await owner.query(await readFile(new URL('../db/schema.sql', import.meta.url), 'utf8'));
-    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql']) {
+    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql', '010_remote_scanner.sql']) {
       await owner.query(await readFile(new URL(`../db/migrations/${migration}`, import.meta.url), 'utf8'));
     }
     process.env.DATABASE_URL = testUrl;
@@ -93,6 +93,19 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.equal(staffLogin.status, 200);
     let adminCookie = adminLogin.cookie;
     const staffCookie = staffLogin.cookie;
+    const remoteSession = await call('/remote-scanner/sessions', 'POST', undefined, staffCookie);
+    assert.equal(remoteSession.status, 201);
+    assert.match(remoteSession.body.token, /^[a-f0-9]{64}$/);
+    const remoteToken = encodeURIComponent(remoteSession.body.token);
+    const remoteScan = await call(`/remote-scanner/sessions/${remoteToken}/scans`, 'POST', { code: 'REMOTE-BARCODE' });
+    assert.equal(remoteScan.status, 202);
+    const remoteScans = await call(`/remote-scanner/sessions/${remoteToken}/scans?after=0`, 'GET', undefined, staffCookie);
+    assert.equal(remoteScans.status, 200);
+    assert.equal(remoteScans.body.scans.length, 1);
+    assert.equal(remoteScans.body.scans[0].code, 'REMOTE-BARCODE');
+    assert.equal((await call(`/remote-scanner/sessions/${remoteToken}/scans?after=${remoteScans.body.scans[0].id}`, 'GET', undefined, staffCookie)).body.scans.length, 0);
+    assert.equal((await call(`/remote-scanner/sessions/${remoteToken}/scans?after=0`, 'GET', undefined, adminCookie)).status, 404);
+    assert.equal((await call(`/remote-scanner/sessions/${remoteToken}`, 'DELETE', undefined, staffCookie)).status, 200);
     const mfaStatus = await call('/auth/mfa/status', 'GET', undefined, adminCookie);
     assert.deepEqual(mfaStatus.body, { enabled: false, recoveryCodesRemaining: 0 });
     const mfaSetup = await call('/auth/mfa/setup', 'POST', { password }, adminCookie);

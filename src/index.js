@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import './config.js';
 import { clientOrigin, configurationError, isProduction, passwordResetConfigurationError, reportTimeZone, trustProxy } from './config.js';
 import { pool, inTransaction, databaseConfigError } from './db.js';
@@ -34,6 +34,13 @@ app.use((req, res, next) => {
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && ((!req.headers.origin && isProduction) || (req.headers.origin && req.headers.origin !== clientOrigin))) return res.status(403).json({ error: 'Origin not allowed.' });
   next();
 });
+const hashRemoteScannerToken = token => createHash('sha256').update(token).digest('hex');
+const remoteScannerToken = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : '';
+const remoteScannerCursor = value => {
+  if (value === undefined) return 0;
+  const cursor = Number(value);
+  return Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : null;
+};
 async function limitLogin(req, res, next) {
   const email = String(req.body?.email || '').trim().toLowerCase();
   req.loginKey = loginAttemptKey(req.ip, email);
@@ -179,6 +186,53 @@ app.post('/api/auth/password-reset/complete', async (req, res, next) => {
 app.get('/api/auth/me', authenticate, (req, res) => res.json(req.user));
 app.post('/api/auth/logout', authenticate, async (req, res, next) => {
   try { await pool.query('DELETE FROM sessions WHERE token_hash=$1', [req.sessionHash]); clearSessionCookie(res); res.json({ ok: true }); } catch (error) { next(error); }
+});
+
+app.post('/api/remote-scanner/sessions', requireRole('staff', 'admin'), async (req, res, next) => {
+  const token = randomBytes(32).toString('hex');
+  try {
+    await pool.query('DELETE FROM remote_scanner_sessions WHERE expires_at <= NOW()');
+    const { rows } = await pool.query(`INSERT INTO remote_scanner_sessions (token_hash, owner_session_hash, expires_at)
+      VALUES ($1,$2,NOW() + INTERVAL '10 minutes') RETURNING expires_at AS "expiresAt"`, [hashRemoteScannerToken(token), req.sessionHash]);
+    res.status(201).json({ token, expiresAt: rows[0].expiresAt });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/remote-scanner/sessions/:token/scans', async (req, res, next) => {
+  const token = remoteScannerToken(req.params.token);
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  if (!token) return res.status(400).json({ error: 'Invalid remote scanner pairing.' });
+  if (!code || code.length > 200) return res.status(400).json({ error: 'A barcode or QR code is required.' });
+  try {
+    const { rows } = await pool.query(`INSERT INTO remote_scanner_scans (token_hash, code)
+      SELECT $1,$2 WHERE EXISTS (SELECT 1 FROM remote_scanner_sessions WHERE token_hash=$1 AND expires_at > NOW()) RETURNING id`, [hashRemoteScannerToken(token), code]);
+    if (!rows[0]) return res.status(404).json({ error: 'Remote scanner pairing expired.' });
+    res.status(202).json({ accepted: true });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/remote-scanner/sessions/:token/scans', requireRole('staff', 'admin'), async (req, res, next) => {
+  const token = remoteScannerToken(req.params.token);
+  const after = remoteScannerCursor(req.query.after);
+  if (!token) return res.status(400).json({ error: 'Invalid remote scanner pairing.' });
+  if (after === null) return res.status(400).json({ error: 'Invalid remote scanner cursor.' });
+  try {
+    const { rows: sessions } = await pool.query(`SELECT expires_at AS "expiresAt" FROM remote_scanner_sessions
+      WHERE token_hash=$1 AND owner_session_hash=$2 AND expires_at > NOW()`, [hashRemoteScannerToken(token), req.sessionHash]);
+    if (!sessions[0]) return res.status(404).json({ error: 'Remote scanner pairing expired.' });
+    const { rows: scans } = await pool.query(`SELECT id, code, created_at AS "createdAt" FROM remote_scanner_scans
+      WHERE token_hash=$1 AND id>$2 ORDER BY id LIMIT 50`, [hashRemoteScannerToken(token), after]);
+    res.json({ scans, expiresAt: sessions[0].expiresAt });
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/remote-scanner/sessions/:token', requireRole('staff', 'admin'), async (req, res, next) => {
+  const token = remoteScannerToken(req.params.token);
+  if (!token) return res.status(400).json({ error: 'Invalid remote scanner pairing.' });
+  try {
+    await pool.query('DELETE FROM remote_scanner_sessions WHERE token_hash=$1 AND owner_session_hash=$2', [hashRemoteScannerToken(token), req.sessionHash]);
+    res.json({ ok: true });
+  } catch (error) { next(error); }
 });
 
 app.get('/api/health', async (_req, res, next) => {
