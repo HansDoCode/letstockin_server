@@ -24,16 +24,11 @@ export async function createSession(userId) {
   return token;
 }
 export const cookieName = 'letstockin_session';
-// Production normally reaches Render through the Vercel /api rewrite, making
-// the cookie first-party. Partitioned is also enabled as a safe fallback for
-// browsers that call the Render origin directly while blocking third-party
-// cookies. Exact Origin validation still protects mutating API requests.
 export function sessionCookieOptions(production = isProduction) {
   return {
     httpOnly: true,
     secure: production,
-    sameSite: production ? 'none' : 'lax',
-    ...(production ? { partitioned: true } : {}),
+    sameSite: 'lax',
     path: '/'
   };
 }

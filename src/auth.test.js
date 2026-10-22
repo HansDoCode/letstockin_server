@@ -18,12 +18,11 @@ test('role gate uses authenticated user, not request headers', () => {
   assert.equal(status, 403);
 });
 
-test('production session cookies support secure partitioned deployments', () => {
+test('session cookies are secure and first-party in production', () => {
   assert.deepEqual(sessionCookieOptions(true), {
     httpOnly: true,
     secure: true,
-    sameSite: 'none',
-    partitioned: true,
+    sameSite: 'lax',
     path: '/'
   });
   assert.deepEqual(sessionCookieOptions(false), {
