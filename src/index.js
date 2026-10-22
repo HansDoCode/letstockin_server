@@ -191,10 +191,16 @@ app.post('/api/auth/logout', authenticate, async (req, res, next) => {
 app.post('/api/remote-scanner/sessions', requireRole('staff', 'admin'), async (req, res, next) => {
   const token = randomBytes(32).toString('hex');
   try {
-    await pool.query('DELETE FROM remote_scanner_sessions WHERE expires_at <= NOW()');
-    const { rows } = await pool.query(`INSERT INTO remote_scanner_sessions (token_hash, owner_session_hash, expires_at)
-      VALUES ($1,$2,NOW() + INTERVAL '10 minutes') RETURNING expires_at AS "expiresAt"`, [hashRemoteScannerToken(token), req.sessionHash]);
-    res.status(201).json({ token, expiresAt: rows[0].expiresAt });
+    const session = await inTransaction(async db => {
+      await db.query('SELECT token_hash FROM sessions WHERE token_hash=$1 FOR UPDATE', [req.sessionHash]);
+      const { rowCount } = await db.query('SELECT 1 FROM remote_scanner_sessions WHERE owner_session_hash=$1 LIMIT 2', [req.sessionHash]);
+      if (rowCount >= 2) return null;
+      const { rows } = await db.query(`INSERT INTO remote_scanner_sessions (token_hash, owner_session_hash)
+        VALUES ($1,$2) RETURNING created_at AS "createdAt"`, [hashRemoteScannerToken(token), req.sessionHash]);
+      return rows[0];
+    });
+    if (!session) return res.status(409).json({ error: 'Only two remote devices can be paired at a time.' });
+    res.status(201).json({ token, createdAt: session.createdAt });
   } catch (error) { next(error); }
 });
 
@@ -205,8 +211,8 @@ app.post('/api/remote-scanner/sessions/:token/scans', async (req, res, next) => 
   if (!code || code.length > 200) return res.status(400).json({ error: 'A barcode or QR code is required.' });
   try {
     const { rows } = await pool.query(`INSERT INTO remote_scanner_scans (token_hash, code)
-      SELECT $1,$2 WHERE EXISTS (SELECT 1 FROM remote_scanner_sessions WHERE token_hash=$1 AND expires_at > NOW()) RETURNING id`, [hashRemoteScannerToken(token), code]);
-    if (!rows[0]) return res.status(404).json({ error: 'Remote scanner pairing expired.' });
+      SELECT $1,$2 WHERE EXISTS (SELECT 1 FROM remote_scanner_sessions WHERE token_hash=$1) RETURNING id`, [hashRemoteScannerToken(token), code]);
+    if (!rows[0]) return res.status(404).json({ error: 'Remote scanner pairing not found.' });
     res.status(202).json({ accepted: true });
   } catch (error) { next(error); }
 });
@@ -217,12 +223,12 @@ app.get('/api/remote-scanner/sessions/:token/scans', requireRole('staff', 'admin
   if (!token) return res.status(400).json({ error: 'Invalid remote scanner pairing.' });
   if (after === null) return res.status(400).json({ error: 'Invalid remote scanner cursor.' });
   try {
-    const { rows: sessions } = await pool.query(`SELECT expires_at AS "expiresAt" FROM remote_scanner_sessions
-      WHERE token_hash=$1 AND owner_session_hash=$2 AND expires_at > NOW()`, [hashRemoteScannerToken(token), req.sessionHash]);
-    if (!sessions[0]) return res.status(404).json({ error: 'Remote scanner pairing expired.' });
+    const { rows: sessions } = await pool.query(`SELECT created_at AS "createdAt" FROM remote_scanner_sessions
+      WHERE token_hash=$1 AND owner_session_hash=$2`, [hashRemoteScannerToken(token), req.sessionHash]);
+    if (!sessions[0]) return res.status(404).json({ error: 'Remote scanner pairing not found.' });
     const { rows: scans } = await pool.query(`SELECT id, code, created_at AS "createdAt" FROM remote_scanner_scans
       WHERE token_hash=$1 AND id>$2 ORDER BY id LIMIT 50`, [hashRemoteScannerToken(token), after]);
-    res.json({ scans, expiresAt: sessions[0].expiresAt });
+    res.json({ scans, createdAt: sessions[0].createdAt });
   } catch (error) { next(error); }
 });
 

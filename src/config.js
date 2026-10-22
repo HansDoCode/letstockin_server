@@ -21,7 +21,7 @@ const configuredDeliveryProvider = String(process.env.PASSWORD_RESET_DELIVERY_PR
 const configuredBrevoApiKey = String(process.env.BREVO_API_KEY || '').trim();
 const configuredPasswordResetFromEmail = String(process.env.PASSWORD_RESET_FROM_EMAIL || '').trim();
 const configuredMfaEncryptionKey = String(process.env.MFA_ENCRYPTION_KEY || '').trim();
-const configuredReportTimeZone = String(process.env.REPORT_TIME_ZONE || '').trim() || 'America/Los_Angeles';
+const configuredReportTimeZone = String(process.env.REPORT_TIME_ZONE || '').trim() || 'Asia/Manila';
 
 export function parseClientOrigin(value) {
   if (!value) return '';
