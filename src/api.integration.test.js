@@ -61,7 +61,7 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     await owner.query(`CREATE SCHEMA "${schema}"`);
     await owner.query(`SET search_path TO "${schema}"`);
     await owner.query(await readFile(new URL('../db/schema.sql', import.meta.url), 'utf8'));
-    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql', '010_remote_scanner.sql', '011_persistent_remote_scanners.sql']) {
+    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql', '010_remote_scanner.sql', '011_persistent_remote_scanners.sql', '012_remote_scanner_pairing_status.sql']) {
       await owner.query(await readFile(new URL(`../db/migrations/${migration}`, import.meta.url), 'utf8'));
     }
     process.env.DATABASE_URL = testUrl;
@@ -96,16 +96,25 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     const remoteSession = await call('/remote-scanner/sessions', 'POST', undefined, staffCookie);
     assert.equal(remoteSession.status, 201);
     assert.match(remoteSession.body.token, /^[a-f0-9]{64}$/);
+    assert.equal(remoteSession.body.pairedAt, null);
     const secondRemoteSession = await call('/remote-scanner/sessions', 'POST', undefined, staffCookie);
     assert.equal(secondRemoteSession.status, 201);
+    assert.equal(secondRemoteSession.body.pairedAt, null);
     assert.equal((await call('/remote-scanner/sessions', 'POST', undefined, staffCookie)).status, 409);
     const remoteToken = encodeURIComponent(remoteSession.body.token);
+    const remotePair = await call(`/remote-scanner/sessions/${remoteToken}/pair`, 'POST');
+    assert.equal(remotePair.status, 200);
+    assert.ok(remotePair.body.pairedAt);
     const remoteScan = await call(`/remote-scanner/sessions/${remoteToken}/scans`, 'POST', { code: 'REMOTE-BARCODE' });
     assert.equal(remoteScan.status, 202);
     const remoteScans = await call(`/remote-scanner/sessions/${remoteToken}/scans?after=0`, 'GET', undefined, staffCookie);
     assert.equal(remoteScans.status, 200);
     assert.equal(remoteScans.body.scans.length, 1);
+    assert.ok(remoteScans.body.pairedAt);
     assert.equal(remoteScans.body.scans[0].code, 'REMOTE-BARCODE');
+    const secondRemoteScans = await call(`/remote-scanner/sessions/${encodeURIComponent(secondRemoteSession.body.token)}/scans?after=0`, 'GET', undefined, staffCookie);
+    assert.equal(secondRemoteScans.status, 200);
+    assert.equal(secondRemoteScans.body.pairedAt, null);
     assert.equal((await call(`/remote-scanner/sessions/${remoteToken}/scans?after=${remoteScans.body.scans[0].id}`, 'GET', undefined, staffCookie)).body.scans.length, 0);
     assert.equal((await call(`/remote-scanner/sessions/${remoteToken}/scans?after=0`, 'GET', undefined, adminCookie)).status, 404);
     assert.equal((await call(`/remote-scanner/sessions/${remoteToken}`, 'DELETE', undefined, staffCookie)).status, 200);

@@ -1,0 +1,1 @@
+ALTER TABLE IF EXISTS remote_scanner_sessions ADD COLUMN IF NOT EXISTS paired_at TIMESTAMPTZ;

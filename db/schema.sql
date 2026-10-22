@@ -4,7 +4,7 @@ CREATE TYPE product_identifier_type AS ENUM ('barcode', 'qr');
 CREATE TABLE users (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role user_role NOT NULL DEFAULT 'staff', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE INDEX sessions_user_idx ON sessions(user_id);
-CREATE TABLE remote_scanner_sessions (token_hash TEXT PRIMARY KEY, owner_session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE remote_scanner_sessions (token_hash TEXT PRIMARY KEY, owner_session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), paired_at TIMESTAMPTZ);
 CREATE TABLE remote_scanner_scans (id BIGSERIAL PRIMARY KEY, token_hash TEXT NOT NULL REFERENCES remote_scanner_sessions(token_hash) ON DELETE CASCADE, code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE INDEX remote_scanner_scans_session_idx ON remote_scanner_scans(token_hash, id);
 CREATE TABLE user_mfa (user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret_ciphertext TEXT NOT NULL, enabled_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
