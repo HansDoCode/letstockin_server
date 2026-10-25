@@ -20,6 +20,9 @@ const configuredDeliveryToken = String(process.env.PASSWORD_RESET_DELIVERY_TOKEN
 const configuredDeliveryProvider = String(process.env.PASSWORD_RESET_DELIVERY_PROVIDER || '').trim().toLowerCase();
 const configuredBrevoApiKey = String(process.env.BREVO_API_KEY || '').trim();
 const configuredPasswordResetFromEmail = String(process.env.PASSWORD_RESET_FROM_EMAIL || '').trim();
+const configuredGoogleClientId = String(process.env.GOOGLE_CLIENT_ID || '').trim();
+const configuredGoogleClientSecret = String(process.env.GOOGLE_CLIENT_SECRET || '').trim();
+const configuredGoogleRedirectUri = String(process.env.GOOGLE_REDIRECT_URI || '').trim();
 const configuredMfaEncryptionKey = String(process.env.MFA_ENCRYPTION_KEY || '').trim();
 const configuredReportTimeZone = String(process.env.REPORT_TIME_ZONE || '').trim() || 'Asia/Manila';
 
@@ -52,6 +55,17 @@ function parseDeliveryUrl(value) {
   }
 }
 
+function parseRedirectUri(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname === '/') return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
 function validFromEmail(value) {
   if (!value || value.length > 320 || /[\r\n]/.test(value)) return false;
   const address = value.match(/<([^<>]+)>$/)?.[1] || value;
@@ -68,6 +82,9 @@ export const clientOrigin = parseClientOrigin(configuredOrigin || fallbackOrigin
 export const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
 export const passwordResetDeliveryProvider = configuredDeliveryProvider || (configuredDeliveryUrl || configuredDeliveryToken ? 'webhook' : 'brevo');
 export const passwordResetFromEmail = configuredPasswordResetFromEmail;
+export const googleClientId = configuredGoogleClientId;
+export const googleClientSecret = configuredGoogleClientSecret;
+export const googleRedirectUri = parseRedirectUri(configuredGoogleRedirectUri)?.toString() || '';
 export const reportTimeZone = configuredReportTimeZone;
 const originConfigurationError = configuredOrigin && !clientOrigin
   ? 'CLIENT_ORIGIN must be an absolute HTTP(S) origin without credentials, query parameters, or fragments.'
@@ -93,6 +110,10 @@ export const mfaConfigurationError = production && configuredMfaEncryptionKey.le
 const providerConfigurationError = configuredDeliveryProvider && !['brevo', 'webhook'].includes(configuredDeliveryProvider)
   ? 'PASSWORD_RESET_DELIVERY_PROVIDER must be brevo or webhook.'
   : '';
+const googleConfigured = Boolean(configuredGoogleClientId || configuredGoogleClientSecret || configuredGoogleRedirectUri);
+export const googleConfigurationError = googleConfigured && (!configuredGoogleClientId || !configuredGoogleClientSecret || !googleRedirectUri || (production && !googleRedirectUri.startsWith('https:')))
+  ? 'Google sign-in requires a client ID, client secret, and HTTPS redirect URI in production.'
+  : '';
 const reportTimeZoneConfigurationError = !validTimeZone(configuredReportTimeZone)
   ? 'REPORT_TIME_ZONE must be a valid IANA timezone.'
   : '';
@@ -103,4 +124,4 @@ export const passwordResetConfigurationError = process.env.NODE_ENV === 'test'
     : passwordResetDeliveryProvider === 'webhook' && !deliveryUrl
       ? 'Password reset webhook delivery requires a valid URL.'
       : providerConfigurationError || webhookConfigurationError || brevoConfigurationError;
-export const configurationError = originConfigurationError || providerConfigurationError || webhookConfigurationError || brevoConfigurationError || mfaConfigurationError || reportTimeZoneConfigurationError || passwordResetConfigurationError;
+export const configurationError = originConfigurationError || providerConfigurationError || webhookConfigurationError || brevoConfigurationError || googleConfigurationError || mfaConfigurationError || reportTimeZoneConfigurationError || passwordResetConfigurationError;

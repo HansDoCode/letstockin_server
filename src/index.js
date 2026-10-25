@@ -2,9 +2,10 @@ import express from 'express';
 import cors from 'cors';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import './config.js';
-import { clientOrigin, configurationError, isProduction, passwordResetConfigurationError, reportTimeZone, trustProxy } from './config.js';
+import { clientOrigin, configurationError, googleClientId, googleClientSecret, googleConfigurationError, googleRedirectUri, isProduction, passwordResetConfigurationError, reportTimeZone, trustProxy } from './config.js';
 import { pool, inTransaction, databaseConfigError } from './db.js';
 import { authenticate, requireRole, verifyPassword, hashPassword, createSession, setSessionCookie, clearSessionCookie } from './auth.js';
+import { clearGoogleOAuthCookies, createGoogleAuthorizationRequest, exchangeGoogleCode, findOrLinkGoogleUser, googleOAuthCookies, GoogleOAuthError, matchesGoogleState, setGoogleOAuthCookies } from './google-auth.js';
 import { loginAttemptKey, isLoginBlocked, recordLoginFailure, clearLoginFailures } from './login-rate-limit.js';
 import { passwordResetAttemptKey, isPasswordResetBlocked, recordPasswordResetRequest } from './password-reset-rate-limit.js';
 import { requestPasswordReset, completePasswordReset } from './password-reset.js';
@@ -75,6 +76,38 @@ async function currentPasswordMatches(userId, password) {
 async function revokeOtherSessions(userId, currentSessionHash) {
   await pool.query('DELETE FROM sessions WHERE user_id=$1 AND token_hash <> $2', [userId, currentSessionHash]);
 }
+
+function redirectGoogleError(res, code) {
+  if (!clientOrigin) return res.status(503).json({ error: 'Server configuration is invalid.' });
+  const url = new URL(clientOrigin);
+  url.searchParams.set('authError', code);
+  return res.redirect(url.toString());
+}
+
+app.get('/api/auth/google', (_req, res) => {
+  if (googleConfigurationError || !googleClientId || !googleClientSecret || !googleRedirectUri) return redirectGoogleError(res, 'google-not-configured');
+  const request = createGoogleAuthorizationRequest();
+  setGoogleOAuthCookies(res, request.state, request.codeVerifier);
+  res.redirect(request.url);
+});
+
+app.get('/api/auth/google/callback', async (req, res, next) => {
+  const { state, codeVerifier } = googleOAuthCookies(req);
+  clearGoogleOAuthCookies(res);
+  if (req.query.error === 'access_denied') return redirectGoogleError(res, 'google-cancelled');
+  if (!matchesGoogleState(state, String(req.query.state || ''))) return redirectGoogleError(res, 'google-invalid-state');
+  const code = typeof req.query.code === 'string' ? req.query.code : '';
+  if (!code || code.length > 4096) return redirectGoogleError(res, 'google-failed');
+  try {
+    const user = await findOrLinkGoogleUser(await exchangeGoogleCode(code, codeVerifier));
+    setSessionCookie(res, await createSession(user.id), true);
+    res.redirect(clientOrigin);
+  } catch (error) {
+    if (error instanceof GoogleOAuthError && ['not-registered', 'account-conflict'].includes(error.code)) return redirectGoogleError(res, `google-${error.code}`);
+    if (!(error instanceof GoogleOAuthError)) console.error('Google sign-in failed.');
+    return redirectGoogleError(res, 'google-failed');
+  }
+});
 
 app.post('/api/auth/login', limitLogin, async (req, res, next) => {
   const email = String(req.body?.email || '').trim().toLowerCase();

@@ -61,7 +61,7 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     await owner.query(`CREATE SCHEMA "${schema}"`);
     await owner.query(`SET search_path TO "${schema}"`);
     await owner.query(await readFile(new URL('../db/schema.sql', import.meta.url), 'utf8'));
-    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql', '010_remote_scanner.sql', '011_persistent_remote_scanners.sql', '012_remote_scanner_pairing_status.sql']) {
+    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql', '010_remote_scanner.sql', '011_persistent_remote_scanners.sql', '012_remote_scanner_pairing_status.sql', '013_google_sign_in.sql']) {
       await owner.query(await readFile(new URL(`../db/migrations/${migration}`, import.meta.url), 'utf8'));
     }
     process.env.DATABASE_URL = testUrl;
