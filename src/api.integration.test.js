@@ -155,6 +155,12 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.equal((await call('/alerts/low-stock', 'GET', undefined, staffCookie)).status, 200);
     assert.equal((await call('/products', 'POST', { name: 'Broken product', variants: [{ size: 'M', sku: 'BAD', priceCents: -1 }] }, adminCookie)).status, 400);
     assert.equal((await call('/users', 'POST', { name: 'No role', email: 'norole@integration.test', password }, adminCookie)).status, 400);
+    const temporaryUser = await call('/users', 'POST', { name: 'Temporary User', email: 'temporary-delete@integration.test', password, role: 'staff' }, adminCookie);
+    assert.equal(temporaryUser.status, 201);
+    assert.equal((await call(`/users/${temporaryUser.body.id}`, 'DELETE', undefined, staffCookie)).status, 403);
+    assert.equal((await call(`/users/${temporaryUser.body.id}`, 'DELETE', undefined, adminCookie)).status, 200);
+    assert.equal((await call(`/users/${temporaryUser.body.id}`, 'DELETE', undefined, adminCookie)).status, 404);
+    assert.equal((await call(`/users/${admin.id}`, 'DELETE', undefined, adminCookie)).status, 400);
 
     const created = await call('/products', 'POST', { name: 'Integration Shirt', variants: [
       { size: 'S', color: 'Navy', sku: `S-${schema}`, barcode: `BAR-${schema}`, qrCode: `QR-${schema}`, priceCents: 1001, quantity: 3, reorderPoint: 5 },

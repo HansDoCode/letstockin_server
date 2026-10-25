@@ -579,6 +579,20 @@ app.post('/api/users', requireRole('admin'), async (req, res, next) => {
   }
 });
 
+// shortcut: hard-delete only supports unused test accounts, replace with deactivation before production.
+app.delete('/api/users/:id', requireRole('admin'), async (req, res, next) => {
+  if (!/^\d+$/.test(req.params.id) || !Number.isSafeInteger(Number(req.params.id)) || Number(req.params.id) < 1) return res.status(400).json({ error: 'Invalid user ID.' });
+  if (String(req.user.id) === req.params.id) return res.status(400).json({ error: 'You cannot delete your own account.' });
+  try {
+    const { rows } = await pool.query('DELETE FROM users WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Team member not found.' });
+    res.json({ ok: true });
+  } catch (error) {
+    if (error.code === '23503') return res.status(409).json({ error: 'This team member has history and cannot be deleted.' });
+    next(error);
+  }
+});
+
 app.post('/api/products', requireRole('admin'), async (req, res, next) => {
   let payload;
   try { payload = normalizeProductPayload(req.body); } catch (error) {
