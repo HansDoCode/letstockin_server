@@ -4,8 +4,19 @@ import { isProduction } from './config.js';
 import { pool } from './db.js';
 
 const scrypt = promisify(scryptCallback);
+
+export function isStrongPassword(password) {
+  return typeof password === 'string'
+    && password.length >= 8
+    && password.length <= 50
+    && /[A-Z]/.test(password)
+    && /[a-z]/.test(password)
+    && /[0-9]/.test(password)
+    && /[^A-Za-z0-9\s]/.test(password);
+}
+
 export async function hashPassword(password) {
-  if (typeof password !== 'string' || password.length < 12 || password.length > 256) throw new Error('Password must be 12–256 characters.');
+  if (!isStrongPassword(password)) throw new Error('Password must be 8-50 characters and include uppercase, lowercase, number, and symbol.');
   const salt = randomBytes(16).toString('hex');
   const hash = await scrypt(password, salt, 64);
   return `scrypt:${salt}:${hash.toString('hex')}`;
@@ -39,7 +50,7 @@ export async function authenticate(req, res, next) {
   try {
     const token = req.headers.cookie?.split(';').map(x => x.trim()).find(x => x.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1);
     if (!token || !/^[a-f0-9]{64}$/.test(token)) return res.status(401).json({ error: 'Sign in required.' });
-    const { rows } = await pool.query('SELECT u.id, u.name, u.email, u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at > NOW()', [digest(token)]);
+    const { rows } = await pool.query('SELECT u.id, u.name, u.email, u.role, u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at > NOW() AND u.active', [digest(token)]);
     if (!rows[0]) return res.status(401).json({ error: 'Session expired. Sign in again.' });
     req.user = rows[0]; req.sessionHash = digest(token); next();
   } catch (error) { next(error); }

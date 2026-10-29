@@ -42,9 +42,9 @@ export function createPasswordResetEmail({ email, name, url }) {
   return {
     sender: parseSender(passwordResetFromEmail),
     to: [{ email, ...(recipientName ? { name: recipientName } : {}) }],
-    subject: 'Reset your Letstockin password',
-    htmlContent: `<p>Hello ${safeName},</p><p>We received a request to reset your Letstockin password.</p><p><a href="${safeUrl}">Reset your password</a></p><p>This link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.</p>`,
-    textContent: `Hello ${recipientName || 'there'},\n\nWe received a request to reset your Letstockin password.\n\nReset your password: ${url}\n\nThis link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.`
+    subject: "Reset your Let'StockIn password",
+    htmlContent: `<p>Hello ${safeName},</p><p>We received a request to reset your Let'StockIn password.</p><p><a href="${safeUrl}">Reset your password</a></p><p>This link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.</p>`,
+    textContent: `Hello ${recipientName || 'there'},\n\nWe received a request to reset your Let'StockIn password.\n\nReset your password: ${url}\n\nThis link expires in ${TOKEN_TTL_MINUTES} minutes and can only be used once. If you did not request this, you can ignore this email.`
   };
 }
 
@@ -108,7 +108,7 @@ export function getTestPasswordResetDelivery() {
 }
 
 export async function requestPasswordReset(email) {
-  const { rows } = await pool.query('SELECT id, name, email FROM users WHERE lower(email)=$1', [email]);
+  const { rows } = await pool.query('SELECT id, name, email FROM users WHERE active AND lower(email)=$1', [email]);
   const user = rows[0];
   if (!user) return { deliveryFailed: false };
 
@@ -137,12 +137,16 @@ export async function requestPasswordReset(email) {
 
 export async function completePasswordReset(token, newPassword) {
   const tokenHash = tokenDigest(token);
-  const { rows: candidates } = await pool.query('SELECT user_id FROM password_reset_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at > NOW()', [tokenHash]);
+  const { rows: candidates } = await pool.query(`SELECT t.user_id FROM password_reset_tokens t
+    JOIN users u ON u.id=t.user_id AND u.active
+    WHERE t.token_hash=$1 AND t.used_at IS NULL AND t.expires_at > NOW()`, [tokenHash]);
   if (!candidates[0]) return false;
   const passwordHash = await hashPassword(newPassword);
 
   return inTransaction(async client => {
-    const { rows } = await client.query('SELECT user_id FROM password_reset_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at > NOW() FOR UPDATE', [tokenHash]);
+    const { rows } = await client.query(`SELECT t.user_id FROM password_reset_tokens t
+      JOIN users u ON u.id=t.user_id AND u.active
+      WHERE t.token_hash=$1 AND t.used_at IS NULL AND t.expires_at > NOW() FOR UPDATE OF t`, [tokenHash]);
     if (!rows[0]) return false;
     const userId = rows[0].user_id;
     await client.query('UPDATE users SET password_hash=$1 WHERE id=$2', [passwordHash, userId]);

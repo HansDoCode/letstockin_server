@@ -4,7 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import './config.js';
 import { clientOrigin, configurationError, googleClientId, googleClientSecret, googleConfigurationError, googleRedirectUri, isProduction, passwordResetConfigurationError, reportTimeZone, trustProxy } from './config.js';
 import { pool, inTransaction, databaseConfigError } from './db.js';
-import { authenticate, requireRole, verifyPassword, hashPassword, createSession, setSessionCookie, clearSessionCookie } from './auth.js';
+import { authenticate, requireRole, verifyPassword, hashPassword, isStrongPassword, createSession, setSessionCookie, clearSessionCookie } from './auth.js';
 import { clearGoogleOAuthCookies, createGoogleAuthorizationRequest, exchangeGoogleCode, findOrLinkGoogleUser, googleOAuthCookies, GoogleOAuthError, matchesGoogleState, setGoogleOAuthCookies } from './google-auth.js';
 import { loginAttemptKey, isLoginBlocked, recordLoginFailure, clearLoginFailures } from './login-rate-limit.js';
 import { passwordResetAttemptKey, isPasswordResetBlocked, recordPasswordResetRequest } from './password-reset-rate-limit.js';
@@ -68,7 +68,7 @@ async function limitPasswordReset(req, res, next) {
 }
 
 async function currentPasswordMatches(userId, password) {
-  if (typeof password !== 'string' || password.length < 12 || password.length > 256) return false;
+  if (typeof password !== 'string' || password.length > 256) return false;
   const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [userId]);
   return Boolean(rows[0] && await verifyPassword(password, rows[0].password_hash));
 }
@@ -117,7 +117,7 @@ app.post('/api/auth/login', limitLogin, async (req, res, next) => {
   try {
     const { rows } = await pool.query(`SELECT u.id, u.name, u.email, u.role, u.password_hash,
       EXISTS(SELECT 1 FROM user_mfa WHERE user_id=u.id) AS "mfaEnabled"
-      FROM users u WHERE lower(u.email)=$1`, [email]);
+      FROM users u WHERE lower(u.email)=$1 AND u.active`, [email]);
     const user = rows[0];
     if (!user || !(await verifyPassword(password, user.password_hash))) {
       await recordLoginFailure(req.loginKey);
@@ -141,7 +141,7 @@ app.post('/api/auth/mfa/verify', async (req, res, next) => {
       if (result.locked) { res.set('Retry-After', '900'); return res.status(429).json({ error: 'Too many verification attempts. Try again later.' }); }
       return res.status(401).json({ error: 'Invalid verification code.' });
     }
-    const { rows } = await pool.query('SELECT id, name, email, role FROM users WHERE id=$1', [result.userId]);
+    const { rows } = await pool.query('SELECT id, name, email, role FROM users WHERE id=$1 AND active', [result.userId]);
     if (!rows[0]) return res.status(401).json({ error: 'Invalid verification code.' });
     await clearLoginFailures(result.loginKey);
     setSessionCookie(res, await createSession(result.userId), remember);
@@ -209,7 +209,7 @@ app.post('/api/auth/password-reset/request', limitPasswordReset, async (req, res
 app.post('/api/auth/password-reset/complete', async (req, res, next) => {
   const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
   const newPassword = req.body?.password;
-  if (!/^[a-f0-9]{64}$/.test(token) || typeof newPassword !== 'string' || newPassword.length < 12 || newPassword.length > 256) return res.status(400).json({ error: 'A valid reset token and a 12–256 character password are required.' });
+  if (!/^[a-f0-9]{64}$/.test(token) || !isStrongPassword(newPassword)) return res.status(400).json({ error: 'A valid reset token and a password with 8-50 characters, uppercase, lowercase, number, and symbol are required.' });
   try {
     if (!await completePasswordReset(token, newPassword)) return res.status(400).json({ error: 'This reset link is invalid or expired.' });
     clearSessionCookie(res);
@@ -365,18 +365,32 @@ app.patch('/api/products/:id/variants', requireRole('admin'), async (req, res, n
       const { rows: currentVariants } = await db.query(`SELECT v.id, v.size, v.color, v.price_cents AS "priceCents", i.quantity
         FROM product_variants v JOIN inventory_levels i ON i.variant_id=v.id
         WHERE v.product_id=$1 ORDER BY v.id FOR UPDATE OF v, i`, [req.params.id]);
-      if (currentVariants.length !== payload.variants.length) throw new Error('Product variants changed. Reload the product and try again.');
+      const existingEntries = payload.variants.filter(entry => entry.id);
+      if (currentVariants.length !== existingEntries.length) throw new Error('Product variants changed. Reload the product and try again.');
       const currentById = new Map(currentVariants.map(variant => [String(variant.id), variant]));
+      if (currentVariants.some(variant => !existingEntries.some(entry => entry.id === String(variant.id)))) throw new Error('Product variants changed. Reload the product and try again.');
       const variantKeys = new Set();
       for (const entry of payload.variants) {
-        const current = currentById.get(entry.id);
-        if (!current) throw new Error('Product variants changed. Reload the product and try again.');
-        if (current.quantity !== entry.expectedQuantity) throw new Error('Stock changed while this form was open. Reload the product and try again.');
-        const key = `${current.size.toLocaleLowerCase('en-US')}\u0000${entry.color.toLocaleLowerCase('en-US')}`;
-        if (variantKeys.has(key)) throw new InputError(`Variant size and color combinations must be unique (${current.size}, ${entry.color}).`);
+        const current = entry.id ? currentById.get(entry.id) : null;
+        if (entry.id && !current) throw new Error('Product variants changed. Reload the product and try again.');
+        if (current && current.quantity !== entry.expectedQuantity) throw new Error('Stock changed while this form was open. Reload the product and try again.');
+        const size = current?.size || entry.size;
+        const key = `${size.toLocaleLowerCase('en-US')}\u0000${entry.color.toLocaleLowerCase('en-US')}`;
+        if (variantKeys.has(key)) throw new InputError(`Variant size and color combinations must be unique (${size}, ${entry.color}).`);
         variantKeys.add(key);
       }
       for (const entry of payload.variants) {
+        if (!entry.id) {
+          const { rows: saved } = await db.query(`INSERT INTO product_variants (product_id, size, color, sku, price_cents)
+            VALUES ($1,$2,$3,$4,$5) RETURNING id`, [product.id, entry.size, entry.color, entry.sku, entry.priceCents]);
+          const variantId = saved[0].id;
+          if (entry.barcode) await db.query("INSERT INTO product_identifiers (variant_id, identifier_type, code) VALUES ($1,'barcode',$2)", [variantId, entry.barcode]);
+          if (entry.qrCode) await db.query("INSERT INTO product_identifiers (variant_id, identifier_type, code) VALUES ($1,'qr',$2)", [variantId, entry.qrCode]);
+          await db.query('INSERT INTO inventory_levels (variant_id, quantity, reorder_point) VALUES ($1,$2,5)', [variantId, entry.quantity]);
+          if (entry.quantity) await db.query(`INSERT INTO inventory_movements (variant_id, quantity_delta, reason, reference_type, reference_id, created_by)
+            VALUES ($1,$2,$3,'product_update',$4,$5)`, [variantId, entry.quantity, payload.reason, product.id, req.user.id]);
+          continue;
+        }
         const current = currentById.get(entry.id);
         const delta = entry.quantity - current.quantity;
         if (current.color !== entry.color || current.priceCents !== entry.priceCents) {
@@ -395,6 +409,7 @@ app.patch('/api/products/:id/variants', requireRole('admin'), async (req, res, n
   } catch (error) {
     if (error instanceof InputError) return res.status(400).json({ error: error.message });
     if (/^(Product variants changed|Stock changed while)/.test(error.message)) return res.status(409).json({ error: error.message });
+    if (error.code === '23505') return res.status(409).json({ error: 'SKU, barcode, or QR code already exists.' });
     next(error);
   }
 });
@@ -406,9 +421,28 @@ app.delete('/api/products/:id', requireRole('admin'), async (req, res, next) => 
       const { rows: products } = await db.query('SELECT id, name FROM products WHERE id=$1 FOR UPDATE', [req.params.id]);
       const current = products[0];
       if (!current) return null;
-      const { rows: sales } = await db.query(`SELECT 1 FROM sale_items si
-        JOIN product_variants v ON v.id=si.variant_id WHERE v.product_id=$1 LIMIT 1`, [req.params.id]);
-      if (sales[0]) throw new Error('Product has sales history and cannot be deleted. Archive it instead.');
+      const { rows: saleItems } = await db.query(`SELECT si.id, si.sale_id FROM sale_items si
+        JOIN product_variants v ON v.id=si.variant_id WHERE v.product_id=$1 FOR UPDATE OF si`, [req.params.id]);
+      if (saleItems.length) {
+        await db.query(`DELETE FROM sale_returns WHERE sale_item_id IN
+          (SELECT si.id FROM sale_items si JOIN product_variants v ON v.id=si.variant_id WHERE v.product_id=$1)`, [req.params.id]);
+        const { rows: deletedItems } = await db.query(`DELETE FROM sale_items
+          WHERE variant_id IN (SELECT id FROM product_variants WHERE product_id=$1) RETURNING sale_id`, [req.params.id]);
+        for (const saleId of new Set(deletedItems.map(row => row.sale_id))) {
+          const { rows: totals } = await db.query(`SELECT COUNT(*)::int AS item_count,
+              COALESCE(SUM(unit_price_cents * quantity),0)::int AS subtotal_cents,
+              COALESCE(SUM(discount_cents),0)::int AS discount_cents,
+              COALESCE(SUM(total_cents),0)::int AS total_cents
+            FROM sale_items WHERE sale_id=$1`, [saleId]);
+          if (!totals[0].item_count) {
+            await db.query('DELETE FROM payments WHERE sale_id=$1', [saleId]);
+            await db.query('DELETE FROM sales WHERE id=$1', [saleId]);
+          } else {
+            await db.query('UPDATE sales SET subtotal_cents=$1, discount_cents=$2, total_cents=$3 WHERE id=$4', [totals[0].subtotal_cents, totals[0].discount_cents, totals[0].total_cents, saleId]);
+            await db.query('UPDATE payments SET amount_cents=$1 WHERE sale_id=$2', [totals[0].total_cents, saleId]);
+          }
+        }
+      }
       await db.query('DELETE FROM inventory_movements WHERE variant_id IN (SELECT id FROM product_variants WHERE product_id=$1)', [req.params.id]);
       await db.query('DELETE FROM inventory_levels WHERE variant_id IN (SELECT id FROM product_variants WHERE product_id=$1)', [req.params.id]);
       await db.query('DELETE FROM product_variants WHERE product_id=$1', [req.params.id]);
@@ -418,7 +452,6 @@ app.delete('/api/products/:id', requireRole('admin'), async (req, res, next) => 
     if (!product) return res.status(404).json({ error: 'Product not found.' });
     res.json({ ok: true, product });
   } catch (error) {
-    if (error.message === 'Product has sales history and cannot be deleted. Archive it instead.') return res.status(409).json({ error: error.message });
     next(error);
   }
 });
@@ -589,7 +622,7 @@ app.get('/api/reports/sales', requireRole('admin'), async (req, res, next) => {
 
 app.get('/api/users', requireRole('admin'), async (_req, res, next) => {
   try {
-    const { rows } = await pool.query(`SELECT id, name, email, role, created_at AS "createdAt" FROM users ORDER BY name`);
+    const { rows } = await pool.query(`SELECT id, name, email, role, active, created_at AS "createdAt" FROM users ORDER BY name`);
     res.json(rows);
   } catch (error) { next(error); }
 });
@@ -600,11 +633,12 @@ app.post('/api/users', requireRole('admin'), async (req, res, next) => {
   const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
   const role = body.role;
   if (!name || name.length > 120 || !/^\S+@\S+\.\S+$/.test(email) || email.length > 320 || !['admin', 'staff'].includes(role)) return res.status(400).json({ error: 'A name, valid email, and role are required.' });
+  if (!email.endsWith('@gmail.com')) return res.status(400).json({ error: 'Only Gmail addresses ending in @gmail.com are accepted.' });
   try {
-    if (typeof body.password !== 'string' || body.password.length < 12 || body.password.length > 256) return res.status(400).json({ error: 'Password must be 12–256 characters.' });
+    if (!isStrongPassword(body.password)) return res.status(400).json({ error: 'Password must be 8-50 characters and include uppercase, lowercase, number, and symbol.' });
     const passwordHash = await hashPassword(body.password);
     const { rows } = await pool.query(`INSERT INTO users (name, email, password_hash, role) VALUES ($1,$2,$3,$4)
-      RETURNING id, name, email, role, created_at AS "createdAt"`, [name, email, passwordHash, role]);
+      RETURNING id, name, email, role, active, created_at AS "createdAt"`, [name, email, passwordHash, role]);
     res.status(201).json(rows[0]);
   } catch (error) {
     if (error.code === '23505') return res.status(409).json({ error: 'An account with that email already exists.' });
@@ -612,18 +646,21 @@ app.post('/api/users', requireRole('admin'), async (req, res, next) => {
   }
 });
 
-// shortcut: hard-delete only supports unused test accounts, replace with deactivation before production.
-app.delete('/api/users/:id', requireRole('admin'), async (req, res, next) => {
+app.patch('/api/users/:id/status', requireRole('admin'), async (req, res, next) => {
   if (!/^\d+$/.test(req.params.id) || !Number.isSafeInteger(Number(req.params.id)) || Number(req.params.id) < 1) return res.status(400).json({ error: 'Invalid user ID.' });
-  if (String(req.user.id) === req.params.id) return res.status(400).json({ error: 'You cannot delete your own account.' });
+  if (typeof req.body?.active !== 'boolean') return res.status(400).json({ error: 'Account status must be active or inactive.' });
+  if (!req.body.active && String(req.user.id) === req.params.id) return res.status(400).json({ error: 'You cannot deactivate your own account.' });
   try {
-    const { rows } = await pool.query('DELETE FROM users WHERE id=$1 RETURNING id', [req.params.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'Team member not found.' });
-    res.json({ ok: true });
-  } catch (error) {
-    if (error.code === '23503') return res.status(409).json({ error: 'This team member has history and cannot be deleted.' });
-    next(error);
-  }
+    const updated = await inTransaction(async db => {
+      const { rows } = await db.query(`UPDATE users SET active=$1 WHERE id=$2
+        RETURNING id, name, email, role, active, created_at AS "createdAt"`, [req.body.active, req.params.id]);
+      if (!rows[0]) return null;
+      if (!req.body.active) await db.query('DELETE FROM sessions WHERE user_id=$1', [req.params.id]);
+      return rows[0];
+    });
+    if (!updated) return res.status(404).json({ error: 'Team member not found.' });
+    res.json(updated);
+  } catch (error) { next(error); }
 });
 
 app.post('/api/products', requireRole('admin'), async (req, res, next) => {

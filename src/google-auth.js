@@ -110,7 +110,7 @@ export async function exchangeGoogleCode(code, codeVerifier) {
 
 export async function findOrLinkGoogleUser(identity) {
   const { rows } = await pool.query(`SELECT id, name, email, role, google_sub AS "googleSub"
-    FROM users WHERE google_sub=$1 OR lower(email)=$2`, [identity.sub, identity.email]);
+    FROM users WHERE active AND (google_sub=$1 OR lower(email)=$2)`, [identity.sub, identity.email]);
   if (rows.length > 1) throw new GoogleOAuthError('account-conflict');
   const user = rows[0];
   if (!user) throw new GoogleOAuthError('not-registered');

@@ -61,7 +61,7 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     await owner.query(`CREATE SCHEMA "${schema}"`);
     await owner.query(`SET search_path TO "${schema}"`);
     await owner.query(await readFile(new URL('../db/schema.sql', import.meta.url), 'utf8'));
-    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql', '010_remote_scanner.sql', '011_persistent_remote_scanners.sql', '012_remote_scanner_pairing_status.sql', '013_google_sign_in.sql']) {
+    for (const migration of ['001_sessions.sql', '002_payments.sql', '003_returns.sql', '004_product_status.sql', '005_login_attempts.sql', '006_password_resets.sql', '009_mfa.sql', '010_remote_scanner.sql', '011_persistent_remote_scanners.sql', '012_remote_scanner_pairing_status.sql', '013_google_sign_in.sql', '018_user_status.sql']) {
       await owner.query(await readFile(new URL(`../db/migrations/${migration}`, import.meta.url), 'utf8'));
     }
     process.env.DATABASE_URL = testUrl;
@@ -70,7 +70,7 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
       import('./index.js'), import('./db.js'), import('./auth.js'), import('./password-reset.js'), import('./mfa.js')
     ]);
     pool = appPool;
-    const password = 'integration-test-password';
+    const password = 'Integration-test-password1!';
     const passwordHash = await hashPassword(password);
     const admin = (await pool.query("INSERT INTO users (name,email,password_hash,role) VALUES ('Admin','admin@integration.test',$1,'admin') RETURNING id", [passwordHash])).rows[0];
     await pool.query("INSERT INTO users (name,email,password_hash,role) VALUES ('Staff','staff@integration.test',$1,'staff')", [passwordHash]);
@@ -155,12 +155,27 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.equal((await call('/alerts/low-stock', 'GET', undefined, staffCookie)).status, 200);
     assert.equal((await call('/products', 'POST', { name: 'Broken product', variants: [{ size: 'M', sku: 'BAD', priceCents: -1 }] }, adminCookie)).status, 400);
     assert.equal((await call('/users', 'POST', { name: 'No role', email: 'norole@integration.test', password }, adminCookie)).status, 400);
-    const temporaryUser = await call('/users', 'POST', { name: 'Temporary User', email: 'temporary-delete@integration.test', password, role: 'staff' }, adminCookie);
+    const nonGmailUser = await call('/users', 'POST', { name: 'Non Gmail', email: 'non-gmail@integration.test', password, role: 'staff' }, adminCookie);
+    assert.equal(nonGmailUser.status, 400);
+    assert.match(nonGmailUser.body.error, /Gmail/);
+    const weakPasswordUser = await call('/users', 'POST', { name: 'Weak Password', email: 'weak-password@gmail.com', password: 'lowercase-password-only' , role: 'staff' }, adminCookie);
+    assert.equal(weakPasswordUser.status, 400);
+    const temporaryUser = await call('/users', 'POST', { name: 'Temporary User', email: 'temporary-status@gmail.com', password, role: 'staff' }, adminCookie);
     assert.equal(temporaryUser.status, 201);
-    assert.equal((await call(`/users/${temporaryUser.body.id}`, 'DELETE', undefined, staffCookie)).status, 403);
-    assert.equal((await call(`/users/${temporaryUser.body.id}`, 'DELETE', undefined, adminCookie)).status, 200);
-    assert.equal((await call(`/users/${temporaryUser.body.id}`, 'DELETE', undefined, adminCookie)).status, 404);
-    assert.equal((await call(`/users/${admin.id}`, 'DELETE', undefined, adminCookie)).status, 400);
+    assert.equal(temporaryUser.body.active, true);
+    const temporaryLogin = await call('/auth/login', 'POST', { email: 'temporary-status@gmail.com', password });
+    assert.equal(temporaryLogin.status, 200);
+    assert.equal((await call(`/users/${temporaryUser.body.id}/status`, 'PATCH', { active: false }, staffCookie)).status, 403);
+    const deactivated = await call(`/users/${temporaryUser.body.id}/status`, 'PATCH', { active: false }, adminCookie);
+    assert.equal(deactivated.status, 200);
+    assert.equal(deactivated.body.active, false);
+    assert.equal((await call('/auth/me', 'GET', undefined, temporaryLogin.cookie)).status, 401);
+    assert.equal((await call('/auth/login', 'POST', { email: 'temporary-status@gmail.com', password })).status, 401);
+    const reactivated = await call(`/users/${temporaryUser.body.id}/status`, 'PATCH', { active: true }, adminCookie);
+    assert.equal(reactivated.status, 200);
+    assert.equal(reactivated.body.active, true);
+    assert.equal((await call('/auth/login', 'POST', { email: 'temporary-status@gmail.com', password })).status, 200);
+    assert.equal((await call(`/users/${admin.id}/status`, 'PATCH', { active: false }, adminCookie)).status, 400);
 
     const created = await call('/products', 'POST', { name: 'Integration Shirt', variants: [
       { size: 'S', color: 'Navy', sku: `S-${schema}`, barcode: `BAR-${schema}`, qrCode: `QR-${schema}`, priceCents: 1001, quantity: 3, reorderPoint: 5 },
@@ -221,7 +236,6 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.equal(finalReturn.status, 201);
     assert.equal(finalReturn.body.refundCents, 2001);
     assert.equal((await call(`/sales/${sale.body.id}/returns`, 'POST', { saleItemId: Number(itemId), quantity: 1, reason: 'extra' }, adminCookie)).status, 409);
-    assert.equal((await call(`/products/${created.body.id}`, 'DELETE', undefined, adminCookie)).status, 409);
     const archived = await call(`/products/${created.body.id}/status`, 'PATCH', { status: 'archived' }, adminCookie);
     assert.equal(archived.status, 200);
     assert.equal(archived.body.status, 'archived');
@@ -273,6 +287,39 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
       { size: 'M', quantity_delta: 2, reference_type: 'product_update', reason: 'Corrected stock and product details' },
       { size: 'S', quantity_delta: 8, reference_type: 'product_update', reason: 'Corrected stock and product details' }
     ]);
+    const variantsBeforeColorAdd = (await pool.query(`SELECT v.id, v.color, v.price_cents, i.quantity FROM product_variants v JOIN inventory_levels i ON i.variant_id=v.id WHERE v.product_id=$1 ORDER BY v.id`, [created.body.id])).rows;
+    const addedColor = await call(`/products/${created.body.id}/variants`, 'PATCH', {
+      reason: 'Added red color group',
+      variants: [
+        ...variantsBeforeColorAdd.map(variant => ({ id: variant.id, color: variant.color, priceCents: variant.price_cents, quantity: variant.quantity, expectedQuantity: variant.quantity })),
+        { id: null, size: 'S', color: 'Red', sku: `RED-${schema}`, barcode: `RED-BAR-${schema}`, qrCode: `RED-QR-${schema}`, priceCents: 1100, quantity: 2 }
+      ]
+    }, adminCookie);
+    assert.equal(addedColor.status, 200);
+    assert.equal(addedColor.body.updatedVariants, 4);
+    const addedColorRow = await pool.query(`SELECT v.size, v.color, v.sku, i.quantity FROM product_variants v JOIN inventory_levels i ON i.variant_id=v.id WHERE v.product_id=$1 AND v.color='Red'`, [created.body.id]);
+    assert.deepEqual(addedColorRow.rows, [{ size: 'S', color: 'Red', sku: `RED-${schema}`, quantity: 2 }]);
+    const companion = await call('/products', 'POST', { name: 'Mixed-sale companion', variants: [{ size: 'One', color: 'Black', sku: `MIX-${schema}`, priceCents: 700, quantity: 2, reorderPoint: 5 }] }, adminCookie);
+    assert.equal(companion.status, 201);
+    const companionInventory = await call(`/inventory?q=${encodeURIComponent('Mixed-sale companion')}`, 'GET', undefined, staffCookie);
+    const companionVariant = companionInventory.body[0];
+    const mixedSale = await call('/sales', 'POST', { items: [{ variantId: small.variant_id, quantity: 1 }, { variantId: companionVariant.variant_id, quantity: 1 }], paymentMethod: 'cash' }, staffCookie);
+    assert.equal(mixedSale.status, 201);
+    assert.equal(mixedSale.body.total_cents, 85700);
+    const deletedProduct = await call(`/products/${created.body.id}`, 'DELETE', undefined, adminCookie);
+    assert.equal(deletedProduct.status, 200);
+    assert.equal((await pool.query('SELECT id FROM products WHERE id=$1', [created.body.id])).rowCount, 0);
+    assert.equal((await pool.query('SELECT id FROM product_variants WHERE product_id=$1', [created.body.id])).rowCount, 0);
+    assert.equal((await pool.query('SELECT id FROM sale_items WHERE sale_id=$1', [sale.body.id])).rowCount, 0);
+    assert.equal((await pool.query('SELECT id FROM sale_returns WHERE sale_id=$1', [sale.body.id])).rowCount, 0);
+    assert.equal((await pool.query('SELECT id FROM payments WHERE sale_id=$1', [sale.body.id])).rowCount, 0);
+    assert.equal((await pool.query('SELECT id FROM sales WHERE id=$1', [sale.body.id])).rowCount, 0);
+    const mixedItems = (await pool.query('SELECT variant_id, quantity, unit_price_cents, total_cents FROM sale_items WHERE sale_id=$1', [mixedSale.body.id])).rows;
+    assert.equal(mixedItems.length, 1);
+    assert.equal(String(mixedItems[0].variant_id), String(companionVariant.variant_id));
+    assert.deepEqual({ quantity: mixedItems[0].quantity, unit_price_cents: mixedItems[0].unit_price_cents, total_cents: mixedItems[0].total_cents }, { quantity: 1, unit_price_cents: 700, total_cents: 700 });
+    assert.deepEqual((await pool.query('SELECT subtotal_cents, discount_cents, total_cents FROM sales WHERE id=$1', [mixedSale.body.id])).rows[0], { subtotal_cents: 700, discount_cents: 0, total_cents: 700 });
+    assert.equal((await pool.query('SELECT amount_cents FROM payments WHERE sale_id=$1', [mixedSale.body.id])).rows[0].amount_cents, 700);
     assert.equal((await pool.query('SELECT id FROM users WHERE id=$1', [admin.id])).rowCount, 1);
 
     const resetRequest = await call('/auth/password-reset/request', 'POST', { email: 'staff@integration.test' });
@@ -281,12 +328,13 @@ test('API/database sales, adjustments, returns, permissions, and lookup', { skip
     assert.equal(delivery.email, 'staff@integration.test');
     const resetToken = new URL(delivery.resetUrl).hash.slice(1).replace(/^token=/, '');
     assert.match(resetToken, /^[a-f0-9]{64}$/);
-    const resetComplete = await call('/auth/password-reset/complete', 'POST', { token: resetToken, password: 'replacement-test-password' });
+    const resetPassword = 'Replacement-test-password1!';
+    const resetComplete = await call('/auth/password-reset/complete', 'POST', { token: resetToken, password: resetPassword });
     assert.equal(resetComplete.status, 200);
     assert.equal((await call('/inventory', 'GET', undefined, staffCookie)).status, 401);
     assert.equal((await call('/auth/login', 'POST', { email: 'staff@integration.test', password })).status, 401);
-    assert.equal((await call('/auth/login', 'POST', { email: 'staff@integration.test', password: 'replacement-test-password' })).status, 200);
-    assert.equal((await call('/auth/password-reset/complete', 'POST', { token: resetToken, password: 'another-test-password' })).status, 400);
+    assert.equal((await call('/auth/login', 'POST', { email: 'staff@integration.test', password: resetPassword })).status, 200);
+    assert.equal((await call('/auth/password-reset/complete', 'POST', { token: resetToken, password: 'Another-test-password1!' })).status, 400);
     for (let attempt = 0; attempt < 5; attempt += 1) assert.equal((await call('/auth/password-reset/request', 'POST', { email: 'unknown-reset@integration.test' })).status, 202);
     const blockedReset = await call('/auth/password-reset/request', 'POST', { email: 'unknown-reset@integration.test' });
     assert.equal(blockedReset.status, 429);

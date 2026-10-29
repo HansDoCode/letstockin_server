@@ -84,17 +84,25 @@ export function normalizeProductVariantUpdatePayload(body) {
   const ids = new Set();
   const variants = body.variants.map((entry, index) => {
     if (!isObject(entry)) throw new InputError(`Variant ${index + 1} is invalid.`);
-    const id = parseVariantId(String(entry.id));
-    if (ids.has(id)) throw new InputError(`Variant ${index + 1} is duplicated.`);
-    ids.add(id);
+    const id = entry.id === null ? null : parseVariantId(String(entry.id));
+    if (id && ids.has(id)) throw new InputError(`Variant ${index + 1} is duplicated.`);
+    if (id) ids.add(id);
+    const size = id ? null : requiredText(entry.size, `Variant ${index + 1} size`, 50);
     const color = requiredText(entry.color, `Variant ${index + 1} color`, 50);
     if (color.toLocaleLowerCase('en-US') === 'unspecified') throw new InputError(`Variant ${index + 1} color must be specified.`);
-    return {
+    const variant = {
       id,
+      ...(size ? { size } : {}),
       color,
       priceCents: integer(entry.priceCents, `Variant ${index + 1} price`, { min: 0 }),
-      quantity: integer(entry.quantity, `Variant ${index + 1} quantity`),
-      expectedQuantity: integer(entry.expectedQuantity, `Variant ${index + 1} expected quantity`)
+      quantity: integer(entry.quantity, `Variant ${index + 1} quantity`)
+    };
+    if (id) return { ...variant, expectedQuantity: integer(entry.expectedQuantity, `Variant ${index + 1} expected quantity`) };
+    return {
+      ...variant,
+      sku: requiredText(entry.sku, `Variant ${index + 1} SKU`, 100),
+      barcode: optionalText(entry.barcode, `Variant ${index + 1} barcode`, 200),
+      qrCode: optionalText(entry.qrCode, `Variant ${index + 1} QR code`, 200)
     };
   });
   return { reason, variants };

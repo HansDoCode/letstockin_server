@@ -32,7 +32,12 @@ test('product variant updates require a reason and absolute stock values', () =>
     reason: 'Counted stock',
     variants: [{ id: '41', color: 'Black', priceCents: 85000, quantity: 9, expectedQuantity: 4 }]
   });
+  assert.deepEqual(normalizeProductVariantUpdatePayload({ reason: 'Added red group', variants: [{ id: null, size: 'S', color: 'Red', sku: 'TEE-RED-S', barcode: '', qrCode: 'QR-RED', priceCents: 85000, quantity: 2 }] }), {
+    reason: 'Added red group',
+    variants: [{ id: null, size: 'S', color: 'Red', priceCents: 85000, quantity: 2, sku: 'TEE-RED-S', barcode: null, qrCode: 'QR-RED' }]
+  });
   assert.throws(() => normalizeProductVariantUpdatePayload({ reason: 'Counted stock', variants: [{ id: '41', color: 'Unspecified', priceCents: 85000, quantity: 9, expectedQuantity: 4 }] }), /color must be specified/);
   assert.throws(() => normalizeProductVariantUpdatePayload({ variants: [{ id: '41', color: 'Black', priceCents: 85000, quantity: 9, expectedQuantity: 4 }] }), /reason/);
   assert.throws(() => normalizeProductVariantUpdatePayload({ reason: 'Counted stock', variants: [{ id: '41', color: 'Black', priceCents: 85000, quantity: -1, expectedQuantity: 4 }] }), /whole number/);
+  assert.throws(() => normalizeProductVariantUpdatePayload({ reason: 'Added red group', variants: [{ id: null, color: 'Red', priceCents: 85000, quantity: 2 }] }), /size/);
 });

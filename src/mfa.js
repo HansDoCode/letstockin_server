@@ -61,8 +61,8 @@ function decodeBase32(value) {
 export function generateTotpSecret() { return encodeBase32(randomBytes(20)); }
 
 export function createOtpAuthUrl(email, secret) {
-  const label = encodeURIComponent(`Letstockin:${email}`);
-  return `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent('Letstockin')}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_STEP_SECONDS}`;
+  const label = encodeURIComponent(`Let'StockIn:${email}`);
+  return `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent("Let'StockIn")}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_STEP_SECONDS}`;
 }
 
 export function totpCode(secret, timestamp = Date.now()) {

@@ -1,14 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hashPassword, verifyPassword, requireRole, sessionCookieOptions, setSessionCookie } from './auth.js';
+import { hashPassword, isStrongPassword, verifyPassword, requireRole, sessionCookieOptions, setSessionCookie } from './auth.js';
 
 test('passwords use salted hashes and reject wrong credentials', async () => {
-  const first = await hashPassword('correct horse battery');
-  const second = await hashPassword('correct horse battery');
+  const password = 'Correct horse battery1!';
+  const first = await hashPassword(password);
+  const second = await hashPassword(password);
   assert.notEqual(first, second);
-  assert.equal(await verifyPassword('correct horse battery', first), true);
+  assert.equal(await verifyPassword(password, first), true);
   assert.equal(await verifyPassword('wrong password', first), false);
   assert.equal(await verifyPassword('correct horse battery', 'pending-password-reset'), false);
+});
+
+test('password policy requires upper, lower, number, and symbol', () => {
+  assert.equal(isStrongPassword('Correct horse battery1!'), true);
+  assert.equal(isStrongPassword('Short1!'), false);
+  assert.equal(isStrongPassword(`Aa1!${'x'.repeat(46)}`), true);
+  assert.equal(isStrongPassword(`Aa1!${'x'.repeat(47)}`), false);
+  for (const password of ['lowercasepassword1!', 'UPPERCASEPASSWORD1!', 'NoNumberPassword!', 'NoSymbolPassword1']) {
+    assert.equal(isStrongPassword(password), false, password);
+  }
 });
 
 test('role gate uses authenticated user, not request headers', () => {

@@ -1,4 +1,4 @@
-CREATE OR REPLACE VIEW report_activity_readable AS
+CREATE OR REPLACE VIEW report_activity_readable WITH (security_invoker = on) AS
 SELECT
   'sale'::text AS type,
   s.id,

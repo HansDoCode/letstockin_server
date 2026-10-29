@@ -7,7 +7,7 @@ process.env.NODE_ENV = 'development';
 process.env.CLIENT_ORIGIN = 'https://pos.example.test';
 process.env.PASSWORD_RESET_DELIVERY_PROVIDER = 'brevo';
 process.env.BREVO_API_KEY = 'unit-test-key';
-process.env.PASSWORD_RESET_FROM_EMAIL = 'Letstockin <no-reply@example.test>';
+process.env.PASSWORD_RESET_FROM_EMAIL = "Let'StockIn <no-reply@example.test>";
 
 const { deliverPasswordReset, PasswordResetDeliveryError } = await import('./password-reset.js');
 const originalFetch = globalThis.fetch;
@@ -36,9 +36,9 @@ test('Brevo delivery sends a reset email payload without following redirects', a
   assert.equal(request.options.redirect, 'error');
   const payload = JSON.parse(request.options.body);
   assert.deepEqual(payload.to, [{ email: 'staff@example.test', name: 'A <B>' }]);
-  assert.deepEqual(payload.sender, { name: 'Letstockin', email: 'no-reply@example.test' });
+  assert.deepEqual(payload.sender, { name: "Let'StockIn", email: 'no-reply@example.test' });
   assert.equal(payload.headers.idempotencyKey, '123e4567-e89b-12d3-a456-426614174000');
-  assert.equal(payload.subject, 'Reset your Letstockin password');
+  assert.equal(payload.subject, "Reset your Let'StockIn password");
   assert.match(payload.htmlContent, /A &lt;B&gt;/);
   assert.match(payload.textContent, /token=unit-value/);
 });

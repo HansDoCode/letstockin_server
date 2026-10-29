@@ -1,7 +1,7 @@
 CREATE TYPE user_role AS ENUM ('admin', 'staff');
 CREATE TYPE product_status AS ENUM ('active', 'archived');
 CREATE TYPE product_identifier_type AS ENUM ('barcode', 'qr');
-CREATE TABLE users (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, google_sub TEXT, role user_role NOT NULL DEFAULT 'staff', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE users (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, google_sub TEXT, role user_role NOT NULL DEFAULT 'staff', active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE UNIQUE INDEX users_google_sub_idx ON users(google_sub) WHERE google_sub IS NOT NULL;
 CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE INDEX sessions_user_idx ON sessions(user_id);
